@@ -1,5 +1,11 @@
 """
-Maksimum kazanç için optimize edilmiş ayarlar.
+Bot ayarları.
+
+Tasarım ilkeleri (2026-08-12 refactor):
+1. Risk dolar cinsinden sabittir; kaldıraç riski DEĞİŞTİRMEZ (bkz. RISK_PER_TRADE_PCT).
+2. Kazananlar kısmi çıkışla korunur ama üst limitsiz koşar (bkz. PARTIAL_* ve CHANDELIER_*).
+3. Günlük durdurma işlem SAYISINA değil, harcanan RİSKE bakar (bkz. DAILY_RISK_BUDGET_R).
+4. Komisyon her hesaba dahildir — breakeven stop bile komisyonun üstüne konur.
 """
 
 import os
@@ -14,7 +20,7 @@ API_SECRET = os.environ["BINANCE_API_SECRET"]
 TESTNET    = False
 
 # ─── Mod ──────────────────────────────────────────────────────────────────────
-PAPER_TRADING = True   # ← 1 hafta paper test — gerçek para yok
+PAPER_TRADING = True   # ← GERÇEK PARA KAPALI. Değiştirmeden önce go_live_check.py çalıştır.
 SPOT_MODE     = False  # Futures modu — kaldıraç + long/short
 
 # ─── Timeframe (multi-timeframe 4 katman) ────────────────────────────────────
@@ -24,71 +30,94 @@ TF_MACRO   = "1h"   # orta vadeli yön
 TF_CONTEXT = "4h"   # büyük resim — en ağırlıklı filtre
 CANDLE_LIMIT = 120
 
-# ─── Elit Coin Listesi ────────────────────────────────────────────────────────
-# False yapıldı (2026-07-26): dar bir listeye bakan bot, listede olmayan
-# hareketleri göremez. EUL/SHIB gibi sert yükselişler tam olarak bu yüzden
-# kaçırıldı — bot onları hiç izlemiyordu. Artık hacme göre en likit TOP_N_COINS
-# taranıyor; likidite filtresi, kimsenin alıp satamadığı çöp coinleri eler.
-USE_ELITE_COINS = False  # True → sadece aşağıdaki coinleri izle
+# ─── Coin evreni ──────────────────────────────────────────────────────────────
+# 2026-08-12: TOP_N 100→250. missed_signals analizi, kaçan yüksek skorlu
+# sinyallerin PENGU/TST/BICO/TUT/PUMP/BOME gibi düşük-cap pump coinlerinde
+# yoğunlaştığını gösterdi — bunlar hacim sıralamasında dalgalanıyor, 100'lük
+# pencerede bazen içeride bazen dışarıda kalıyorlar. Likidite filtresi
+# (MIN_QUOTE_VOLUME_24H) çöp coinleri zaten eliyor, sıralama tavanı değil.
+USE_ELITE_COINS = False
 ELITE_COINS = [
     "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
     "ADAUSDT", "DOGEUSDT", "AVAXUSDT", "LINKUSDT", "DOTUSDT",
     "NEARUSDT", "UNIUSDT", "ATOMUSDT", "LTCUSDT", "SUIUSDT",
     "TRXUSDT", "OPUSDT", "ARBUSDT", "PEPEUSDT", "APTUSDT",
 ]
-TOP_N_COINS              = 100    # USE_ELITE_COINS=False ise kullanılır
+TOP_N_COINS              = 250
 COIN_REFRESH_SEC         = 3600
 OHLCV_REFRESH_SEC        = 60
 OHLCV_REFRESH_SEC_CTX    = 900
 SIGNAL_INTERVAL          = 30
 
+# Likidite / execution kalitesi filtreleri
+MIN_QUOTE_VOLUME_24H     = 3_000_000.0   # 24s hacim (USDT) — altı taranmaz
+MAX_SPREAD_PCT           = 0.0035        # %0.35'ten geniş spread → işlem açma
+
 # ─── Piyasa Rejimi (ADX) ──────────────────────────────────────────────────────
 ADX_PERIOD           = 14
-ADX_TREND_THRESHOLD  = 20   # ADX > 20 → trend market → breakout sinyaller güvenilir
-ADX_RANGE_THRESHOLD  = 15   # ADX 15-25 → range → RSI/BB sinyaller
-# ADX < 15 → kaotik → işlem açma
-
-# ─── Dinamik Risk ─────────────────────────────────────────────────────────────
-DYNAMIC_RISK_ENABLED   = True
-RISK_MIN_PCT           = 0.01   # minimum %1 risk
-RISK_MAX_PCT           = 0.03   # maximum %3 risk
-DYNAMIC_RISK_LOOKBACK  = 10     # son N işlem baz alınır
+ADX_TREND_THRESHOLD  = 20
+ADX_RANGE_THRESHOLD  = 15
 
 # ─── Risk / Pozisyon ──────────────────────────────────────────────────────────
-RISK_PER_TRADE_PCT     = 0.02   # işlem başına bakiyenin max %2'si risk (kural #1)
-MAX_POSITION_PCT       = 0.15   # tek işlem bakiyenin max %15'i (üst tavan)
-# %30 idi. Slot sayısı 2→4 çıkarıldığı için tek pozisyon payı yarıya indirildi:
-# toplam piyasa maruziyeti aynı kalıyor, sadece daha çok parçaya bölünüyor.
-MAX_CAPITAL_RISK_PCT   = 0.50   # toplam açık risk tavanı
-# TP sonrası trailing eklendiğinde stratejinin doğası değişti: artık "çok sayıda
-# küçük zarar, az sayıda çok büyük kazanç" modeli. Bu modelde getiriyi birkaç
-# büyük kazanan taşır, dolayısıyla **kaç deneme yapabildiğin** belirleyicidir.
-# 1 long slotuyla aynı anda tek bilet alınıyordu: EUL koşarken slot vasat bir
-# işlemle doluysa hareket tamamen kaçırılıyordu — 100 coin taramanın anlamı da
-# kalmıyordu. Slot sayısı artırıldı, tek pozisyon payı (MAX_POSITION_PCT)
-# yarıya indirilerek toplam maruziyet sabit tutuldu.
-MAX_OPEN_POSITIONS        = 4
-MAX_CORRELATED_POSITIONS  = 3   # aynı yönde en fazla 3 (kriptoda her şey BTC ile korele)
-MIN_MARGIN_USDT           = 5.0    # minimum 5 USDT işlem
+# İşlem başına risk, EQUITY'nin yüzdesi olarak. Bu, stop'a çarpıldığında
+# kaybedilecek dolar miktarıdır ve kaldıraçtan BAĞIMSIZDIR.
+RISK_PER_TRADE_PCT       = 0.0075   # normal işlem: %0.75
+RISK_PER_TRADE_STRONG_PCT= 0.01     # çok güçlü sinyal (skor >= STRONG_SCORE): %1.0
+STRONG_SIGNAL_SCORE      = 82
 
-# ─── Kill Switch — günlük/haftalık zarar limitleri ───────────────────────────
-DAILY_LOSS_LIMIT_PCT   = 0.03   # günde max %3 zarar → bot o gün durur
-WEEKLY_LOSS_LIMIT_PCT  = 0.07   # haftada max %7 zarar → bot o hafta durur
-MAX_CONSECUTIVE_LOSSES = 3      # üst üste 3 zarar → bot durur
+# Dinamik risk — son işlemlere göre ölçekle
+DYNAMIC_RISK_ENABLED   = True
+RISK_MIN_PCT           = 0.004   # taban %0.4
+RISK_MAX_PCT           = 0.012   # tavan %1.2
+DYNAMIC_RISK_LOOKBACK  = 15
 
-# Kill switch KALICI OLMAMALI. Sayaç yalnızca kârlı bir işlemle sıfırlanıyordu,
-# ama bot durunca yeni işlem açamıyor → kârlı işlem hiç olamıyor → bot bir daha
-# asla açılmıyordu. 2026-07-26'da gerçekten böyle oldu: 15:14'te durdu ve saatlerce
-# "durdum" yazmaktan başka bir şey yapmadı. Soğuma süresi bu kilidi kırar.
-KILL_SWITCH_COOLDOWN_HOURS = 4
-MAX_DAILY_TRADES       = 10     # günde en fazla 10 işlem
+# Teminat tavanı — SADECE marjin yeterliliği içindir, riski belirlemez.
+# ESKİ BUG: bu tavan risk hesabını eziyordu, dolayısıyla gerçek dolar riski
+# kaldıraçla birlikte büyüyordu (5x işlemler 2x'in 2-3 katı risk taşıyordu).
+# Artık tavana takılan pozisyon KÜÇÜLTÜLMEZ, REDDEDİLİR — böylece her işlem
+# ya hedeflenen riski taşır ya da hiç açılmaz.
+MAX_MARGIN_PCT            = 0.35   # tek pozisyon teminatı equity'nin max %35'i
+MAX_TOTAL_MARGIN_PCT      = 0.80   # tüm açık pozisyonların teminat toplamı tavanı
 
-# ─── Komisyon simülasyonu (paper için gerçekçilik) ───────────────────────────
-COMMISSION_RATE = 0.0005   # %0.05 taker fee (her açma/kapamada)
+MAX_OPEN_POSITIONS        = 6      # 4 → 6 (kaçan sinyallerin %15.8'i bu limitti)
+MAX_CORRELATED_POSITIONS  = 4      # aynı yönde en fazla 4
+MIN_MARGIN_USDT           = 5.0
+MAX_PORTFOLIO_RISK_R      = 4.0    # aynı anda açık toplam risk: max 4R
 
-LEV_WEAK    = 2
+# ─── Kill Switch ──────────────────────────────────────────────────────────────
+# Günlük RİSK BÜTÇESİ — işlem sayısı limitinin yerini alır.
+# Her açılan işlem bütçeden riski kadar (1R) düşer. Kapanan kârlı işlem
+# bütçeyi geri besler (max kendi riski kadar). Böylece iyi giden günde bot
+# daha çok işlem yapar, kötü giden günde kendini durdurur.
+DAILY_RISK_BUDGET_R    = 8.0
+RISK_BUDGET_REFUND     = True   # kârlı kapanış bütçeyi geri besler
+
+# Runaway/bug koruması — normal işleyişte ASLA bağlamaz.
+MAX_DAILY_TRADES_HARD  = 40
+
+DAILY_LOSS_LIMIT_PCT   = 0.04   # günde max %4 zarar
+WEEKLY_LOSS_LIMIT_PCT  = 0.10   # haftada max %10 zarar
+MAX_DRAWDOWN_PCT       = 0.20   # tepe bakiyeden %20 düşüş → tam durdurma
+MAX_CONSECUTIVE_LOSSES = 4
+KILL_SWITCH_COOLDOWN_HOURS = 2
+
+# Aynı sembolde arka arkaya işlem açmadan önce bekleme (dakika)
+SYMBOL_COOLDOWN_MIN    = 30
+
+# ─── Komisyon / slippage ──────────────────────────────────────────────────────
+COMMISSION_RATE = 0.0005   # %0.05 taker fee (her açma/kapamada, notional üzerinden)
+SLIPPAGE_PCT    = 0.0004   # backtest ve breakeven hesabında varsayılan kayma
+
+# ─── Kaldıraç ─────────────────────────────────────────────────────────────────
+# Kaldıraç artık KÂRI DEĞİŞTİRMEZ (risk-bazlı boyutlandırmada notional
+# kaldıraçtan bağımsızdır). Tek işlevi aynı anda kaç pozisyon taşınabildiğidir.
+# Bu yüzden güven skoruyla ilişkisi kaldırıldı ve tavan 3x'e çekildi:
+# ölçülen veri 5x diliminin net zararda olduğunu gösteriyordu (8 işlem, -$5.77).
+LEVERAGE_DEFAULT = 3
+LEVERAGE_MAX     = 3
+LEV_WEAK    = 2   # geriye dönük uyumluluk (backtest)
 LEV_MEDIUM  = 3
-LEV_STRONG  = 5
+LEV_STRONG  = 3
 MARGIN_MODE = "ISOLATED"
 
 LIQ_SAFETY_BUFFER = 0.50
@@ -96,33 +125,83 @@ LIQ_SAFETY_BUFFER = 0.50
 # ─── ATR tabanlı dinamik SL/TP ────────────────────────────────────────────────
 ATR_PERIOD      = 14
 SL_ATR_MULT     = 2.0   # SL = giriş ± 2.0×ATR
-# 1.5 idi: gözlenen ilk 4 işlemin DÖRDÜ de stop-loss ile kapandı. Stop, normal
-# piyasa gürültüsünün içinde kalıyordu. Pozisyon boyutu riske göre hesaplandığı
-# için daha geniş stop = daha küçük pozisyon; işlem başına $ riski değişmez,
-# sadece gürültüye erken kurban gitme ihtimali düşer.
-TP_ATR_MULT     = 3.5   # TP = giriş ± 3.5×ATR  → 2.3:1 risk/ödül
-MAX_SL_PCT      = 0.04  # SL hiçbir zaman %4'ü geçmesin
-MAX_TP_PCT      = 0.12  # TP hiçbir zaman %12'yi geçmesin
+TP_ATR_MULT     = 3.5   # ilk hedef referansı (artık zorunlu çıkış değil)
+MAX_SL_PCT      = 0.04
+MAX_TP_PCT      = 0.12
 
-# ─── Kazananı koştur ──────────────────────────────────────────────────────────
-# Eski davranış: fiyat TP'ye değince pozisyon kapanıyordu. Yani %66'lık bir
-# hareket +%1.2'de kesiliyordu (2026-07-26 AVAX işlemi tam olarak böyleydi).
-# Yeni davranış: TP'ye ulaşınca kapatma; stop'u fiyatın arkasına takıp bırak.
-# Böylece büyük hareketler sonuna kadar taşınır, dönüş başlayınca çıkılır.
-# Bunun bedeli var ve bilinçli: TP'de kesin kâr almak yerine, geri dönüşte
-# kârın bir kısmı geri verilir. Küçük hareketlerde eski davranış daha iyiydi;
-# büyük hareketleri yakalamanın karşılığı bu.
+# ─── ÇIKIŞ MOTORU — kısmi kâr + limitsiz runner ──────────────────────────────
+# Kullanıcı talebi: "kâra geçtikten sonra ani düşüşten etkilenmeyelim" +
+# "üst limitsiz maksimum kazanç". Bu ikisi sabit-sıkı stop ile aynı anda
+# sağlanamaz (ort. 5dk ATR %1.26 — %1'lik stop gürültünün içinde kalır).
+# Çözüm: kârın bir kısmını ERKEN NAKDE ÇEVİR, kalanı ATR ile ölçeklenen
+# stop'la SONSUZA KADAR koştur.
+PARTIAL_EXITS_ENABLED = True
+PARTIAL_TP1_R         = 1.0    # +1R'de
+PARTIAL_TP1_PCT       = 0.40   # pozisyonun %40'ı realize edilir
+PARTIAL_TP2_R         = 2.0    # +2R'de
+PARTIAL_TP2_PCT       = 0.30   # %30 daha realize edilir (kalan %30 runner)
+
+# TP1 sonrası stop breakeven'e çekilir — ama KOMİSYONUN ÜSTÜNE.
+# Böylece "kâr etmesek bile zarar etmeyelim" garantisi gerçekten sağlanır.
+BREAKEVEN_AFTER_TP1   = True
+BREAKEVEN_BUFFER_PCT  = 0.0015  # giriş + %0.15 (round-trip komisyon %0.10'u aşar)
+
+# Runner trailing — Chandelier (en yüksek fiyat - N×ATR).
+# SABİT MAKSİMUM TAKE PROFIT YOKTUR. Coin %20, %50, %200 yükselirse
+# pozisyon açık kalır; yalnızca trailing stop'a değince çıkılır.
+CHANDELIER_ATR_MULT_STRONG = 3.5   # momentum güçlü → geniş bırak, hareketi boğma
+CHANDELIER_ATR_MULT_WEAK   = 1.8   # momentum zayıfladı → sıkılaştır, kârı koru
+CHANDELIER_MIN_LOCK_R      = 0.30  # trailing devreye girince en az 0.30R kilitli
+TRAIL_MOMENTUM_LOOKBACK    = 8     # son N döngüde yeni zirve varsa "güçlü" sayılır
+
+# Geriye dönük uyumluluk (eski kod yolları / backtest)
 TRAIL_AFTER_TP        = True
-TRAIL_ATR_MULT        = 2.5   # TP sonrası stop, en yüksek fiyatın 2.5×ATR gerisi
-TRAIL_MIN_LOCK_PCT    = 0.01  # TP'ye ulaşıldığında en az %1 kâr kilitlenir
+TRAIL_ATR_MULT        = 2.5
+TRAIL_MIN_LOCK_PCT    = 0.01
+
+# ─── TIME STOP ────────────────────────────────────────────────────────────────
+# Momentum işlemi açıldıktan sonra hareket gelmiyorsa sermayeyi kilitleme.
+TIME_STOP_ENABLED     = True
+TIME_STOP_MINUTES     = 90     # bu süre içinde
+TIME_STOP_MIN_MFE_R   = 0.5    # en az 0.5R lehte hareket olmadıysa → çık
+TIME_STOP_MAX_MINUTES = 480    # runner olmayan pozisyon için mutlak üst süre
 
 # ─── Volatilite filtresi ──────────────────────────────────────────────────────
-MIN_ATR_PCT     = 0.003   # %0.3 — çok durgun coinleri atla
-MAX_ATR_PCT     = 0.06    # %6  — aşırı volatil coinleri atla
+MIN_ATR_PCT     = 0.003
+MAX_ATR_PCT     = 0.08    # 0.06 → 0.08: pump coinleri dışlamamak için
 
-# ─── Sinyal eşikleri — 0-100 puan sistemi ────────────────────────────────────
-MIN_SIGNAL_SCORE = 60     # 100 üzerinden en az 60 puan
-MIN_CONFIDENCE   = 0.60   # = 60/100
+# ─── Sinyal eşikleri — TREND stratejisi ──────────────────────────────────────
+# 60 → 72. Günlük işlem limiti risk bütçesine çevrildiği için bot artık daha
+# çok işlem açabiliyor; kalite çıtası yükseltilmezse komisyon yükü artardı
+# (ölçüm: komisyon şu an brüt kârın %8.3'ü, işlem başına $0.31).
+MIN_SIGNAL_SCORE = 72
+MIN_CONFIDENCE   = 0.72
+
+# ─── STRATEJİ: MOMENTUM_FAST ─────────────────────────────────────────────────
+# Ayrı, izole momentum motoru. Kendi risk bütçesi var; kötüyse tek satırla
+# kapatılır, ana TREND stratejisini kirletmez.
+MOMENTUM_ENABLED       = True
+MOMENTUM_SHADOW_MODE   = True   # True → sinyal üretir + loglar ama İŞLEM AÇMAZ
+MOMENTUM_RISK_SHARE    = 0.30   # günlük risk bütçesinin en fazla %30'unu kullanır
+MOMENTUM_MIN_SCORE     = 70
+
+# Momentum eşikleri — araştırma aralığı, optimum değer DEĞİL.
+# Backtest ile karşılaştırılabilir parametreler olarak tutulur.
+MOM_RET_1M_MIN         = 0.008   # %0.8
+MOM_RET_3M_MIN         = 0.015   # %1.5
+MOM_RET_5M_MIN         = 0.020   # %2.0
+MOM_REL_VOLUME_MIN     = 3.0     # 3x ortalama hacim
+MOM_TAKER_BUY_RATIO_MIN= 0.58    # alıcı baskısı %58
+MOM_VOL_BASELINE_BARS  = 20      # relative volume için taban pencere
+
+# Overextension / chase koruması — dev yeşil mumun tepesinden alma
+MOM_MAX_EXT_ATR        = 4.0     # fiyat, kısa EMA'dan 4×ATR'den fazla uzaksa reddet
+MOM_MAX_IMPULSE_PCT    = 0.18    # son 5 dakikada %18'den fazla çıktıysa pullback bekle
+MOM_REQUIRE_PULLBACK   = True
+
+# BTC yalnızca REJİM VETOSU — yön filtresi değil.
+# Bağımsız güçlü altcoin momentumu BTC yatay/hafif düşüşteyken reddedilmemeli.
+MOM_BTC_CRASH_PCT      = -0.025  # BTC 15dk'da %2.5+ düşerse yeni momentum işlemi yok
 
 # ─── İndikatör parametreleri ─────────────────────────────────────────────────
 RSI_PERIOD      = 14
@@ -143,4 +222,9 @@ BB_STD          = 2.0
 VWAP_PERIOD     = 20
 
 # ─── Paper Trading ────────────────────────────────────────────────────────────
-PAPER_BALANCE   = 1000.0
+PAPER_BALANCE   = 1000.0   # SADECE ilk çalıştırmada kullanılır; sonrası DB'den gelir
+
+# ─── İzleme / heartbeat ───────────────────────────────────────────────────────
+HEARTBEAT_ENABLED      = True
+HEARTBEAT_INTERVAL_MIN = 60     # bu sıklıkta "yaşıyorum" özeti
+STALE_ALERT_MINUTES    = 15     # sinyal akışı bu kadar durursa alarm

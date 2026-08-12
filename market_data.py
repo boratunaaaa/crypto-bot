@@ -19,9 +19,15 @@ from config import (
     TOP_N_COINS, COIN_REFRESH_SEC, OHLCV_REFRESH_SEC, OHLCV_REFRESH_SEC_CTX,
     EMA_FAST, EMA_SLOW, EMA_TREND,
     USE_ELITE_COINS, ELITE_COINS,
+    MIN_QUOTE_VOLUME_24H, MAX_SPREAD_PCT,
 )
 
 logger = logging.getLogger("market_data")
+
+# Momentum tarayıcısının kullandığı hızlı timeframe.
+# Tüm evren için çekilmez — yalnızca hareket eden kısa liste için (bkz.
+# refresh_fast_ohlcv). 250 sembol × 1m çekmek API kotasını gereksiz tüketirdi.
+TF_FAST = "1m"
 
 
 class MarketDataManager:
@@ -41,6 +47,13 @@ class MarketDataManager:
         self._funding:       dict[str, float] = {}
         self._open_interest: dict[str, float] = {}   # OI değeri (anlık)
         self._oi_prev:       dict[str, float] = {}   # önceki OI (değişim için)
+
+        # Momentum tarayıcısı için: tüm piyasanın 24s istatistikleri tek çağrıda
+        self._ticker:    dict[str, dict] = {}
+        self._ticker_ts: float = 0.0
+        self._fast_ohlcv: dict[str, pd.DataFrame] = {}   # 1m, yalnız kısa liste
+        self._fast_ts:    dict[str, float] = {}
+        self._spread:     dict[str, float] = {}
 
         self._twm:        ThreadedWebsocketManager | None = None
         self._running     = False
@@ -77,7 +90,7 @@ class MarketDataManager:
                     self._symbols = syms
                 logger.info(f"Elit coin listesi: {len(syms)} sembol")
                 return syms
-            # Normal mod — hacme göre top N
+            # Normal mod — likidite filtresi + hacme göre top N
             tickers = self._client.futures_ticker()
             usdt = [
                 t for t in tickers
@@ -85,11 +98,25 @@ class MarketDataManager:
                 and "_" not in t["symbol"]
                 and not any(x in t["symbol"] for x in ["UP", "DOWN", "BULL", "BEAR"])
             ]
-            usdt.sort(key=lambda x: float(x.get("quoteVolume", 0)), reverse=True)
-            syms = [t["symbol"] for t in usdt[:TOP_N_COINS]]
+            with self._lock:
+                self._ticker = {t["symbol"]: t for t in usdt}
+                self._ticker_ts = time.time()
+
+            # Likidite filtresi: sıralama tavanı yerine gerçek hacim eşiği.
+            # Amaç, henüz top-100 hacme girmemiş ama işlem yapılabilir coinleri
+            # de görebilmek — pump'lar tam olarak orada başlıyor.
+            liquid = [
+                t for t in usdt
+                if float(t.get("quoteVolume", 0)) >= MIN_QUOTE_VOLUME_24H
+            ]
+            liquid.sort(key=lambda x: float(x.get("quoteVolume", 0)), reverse=True)
+            syms = [t["symbol"] for t in liquid[:TOP_N_COINS]]
             with self._lock:
                 self._symbols = syms
-            logger.info(f"Coin listesi güncellendi: {len(syms)} sembol (Futures)")
+            logger.info(
+                f"Coin listesi güncellendi: {len(syms)} sembol "
+                f"({len(usdt)} USDT perp, {len(liquid)} likidite filtresini geçti)"
+            )
             return syms
         except Exception as e:
             logger.error(f"Coin listesi hatası: {e}")
@@ -355,6 +382,139 @@ class MarketDataManager:
                 self._twm.stop()
             except Exception:
                 pass
+
+    # ── Momentum tarayıcısı verisi ───────────────────────────────────────────
+    #
+    # Tasarım: tüm evren için 1m mum çekmek API kotasını tüketir (250 sembol ×
+    # 2 ağırlık = her dakika 500 ağırlık, sadece bu iş için). Bunun yerine iki
+    # aşama: (1) `futures_ticker()` TEK çağrıyla tüm piyasanın 24s hareketini
+    # verir, buradan hareket eden kısa liste çıkarılır; (2) 1m mumlar yalnız o
+    # kısa liste için çekilir. Böylece hem tüm piyasa görülür hem kota korunur.
+
+    def refresh_ticker(self) -> None:
+        try:
+            tickers = self._client.futures_ticker()
+            with self._lock:
+                self._ticker = {
+                    t["symbol"]: t for t in tickers
+                    if t["symbol"].endswith("USDT") and "_" not in t["symbol"]
+                }
+                self._ticker_ts = time.time()
+        except Exception as e:
+            logger.debug(f"Ticker güncelleme hatası: {e}")
+
+    def get_movers(self, n: int = 25, min_change_pct: float = 0.02) -> list[str]:
+        """
+        24 saatlik değişime göre en çok hareket eden likit semboller.
+
+        Bu, momentum tarayıcısının kısa listesidir — pump başlamadan önce
+        hacim sıralamasında henüz üste çıkmamış coinleri de kapsar.
+        """
+        with self._lock:
+            snapshot = list(self._ticker.values())
+        if not snapshot:
+            return []
+        out = []
+        for t in snapshot:
+            try:
+                qv = float(t.get("quoteVolume", 0))
+                if qv < MIN_QUOTE_VOLUME_24H:
+                    continue
+                chg = abs(float(t.get("priceChangePercent", 0))) / 100.0
+                if chg < min_change_pct:
+                    continue
+                out.append((t["symbol"], chg))
+            except (TypeError, ValueError):
+                continue
+        out.sort(key=lambda x: x[1], reverse=True)
+        return [s for s, _ in out[:n]]
+
+    def _fetch_fast_df(self, symbol: str) -> pd.DataFrame | None:
+        """1m mumlar — taker alım hacmi ve işlem sayısı dahil."""
+        try:
+            klines = self._client.futures_klines(symbol=symbol, interval=TF_FAST, limit=60)
+            df = pd.DataFrame(klines, columns=[
+                "open_time","open","high","low","close","volume",
+                "close_time","quote_volume","trades",
+                "taker_buy_base","taker_buy_quote","ignore",
+            ])
+            for col in ["open","high","low","close","volume",
+                        "quote_volume","taker_buy_base","taker_buy_quote"]:
+                df[col] = df[col].astype(float)
+            df["trades"] = df["trades"].astype(int)
+            df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+            df.set_index("open_time", inplace=True)
+            return df[["open","high","low","close","volume",
+                       "quote_volume","trades","taker_buy_base","taker_buy_quote"]]
+        except Exception as e:
+            logger.debug(f"Fast OHLCV hatası {symbol}: {e}")
+            return None
+
+    def refresh_fast_ohlcv(self, symbols: list[str], max_age: float = 45.0) -> int:
+        """Kısa liste için 1m mumları tazele. Dönüş: güncellenen sembol sayısı."""
+        now = time.time()
+        updated = 0
+        for sym in symbols:
+            if now - self._fast_ts.get(sym, 0) < max_age:
+                continue
+            df = self._fetch_fast_df(sym)
+            if df is not None and not df.empty:
+                with self._lock:
+                    self._fast_ohlcv[sym] = df
+                    self._fast_ts[sym] = now
+                updated += 1
+            time.sleep(0.05)
+        return updated
+
+    def get_fast_df(self, symbol: str, max_age: float = 180.0) -> pd.DataFrame | None:
+        """1m veri — bayatsa None döner (staleness kontrolü zorunlu)."""
+        with self._lock:
+            ts = self._fast_ts.get(symbol, 0)
+            if time.time() - ts > max_age:
+                return None
+            df = self._fast_ohlcv.get(symbol)
+            return df.copy() if df is not None else None
+
+    def get_spread_pct(self, symbol: str) -> float | None:
+        """Bid/ask spread yüzdesi. Bilinmiyorsa None (filtre 'bilinmiyor'u geçirir)."""
+        with self._lock:
+            cached = self._spread.get(symbol)
+        if cached is not None:
+            return cached
+        try:
+            ob = self._client.futures_orderbook_ticker(symbol=symbol)
+            bid = float(ob["bidPrice"]); ask = float(ob["askPrice"])
+            if bid <= 0 or ask <= 0:
+                return None
+            spread = (ask - bid) / ((ask + bid) / 2)
+            with self._lock:
+                self._spread[symbol] = spread
+            return spread
+        except Exception:
+            return None
+
+    def clear_spread_cache(self):
+        with self._lock:
+            self._spread.clear()
+
+    def get_oi_change_pct(self, symbol: str) -> float:
+        """Open interest değişim yüzdesi (son iki ölçüm arası)."""
+        with self._lock:
+            cur  = self._open_interest.get(symbol, 0.0)
+            prev = self._oi_prev.get(symbol, 0.0)
+        if prev <= 0:
+            return 0.0
+        return (cur - prev) / prev
+
+    def get_btc_change_15m(self) -> float:
+        """BTC'nin son 15 dakikalık değişimi — momentum rejim vetosu için."""
+        df = self.get_ohlcv("BTCUSDT", TF_TREND)
+        if df is None or len(df) < 2:
+            return 0.0
+        try:
+            return (df["close"].iloc[-1] - df["close"].iloc[-2]) / df["close"].iloc[-2]
+        except Exception:
+            return 0.0
 
     # ── Erişim (thread-safe) ─────────────────────────────────────────────────
 

@@ -1,7 +1,6 @@
-python-binance==1.0.19
-pandas==2.2.2
-pandas-ta==0.3.14b
-rich==13.7.1
-numpy==1.26.4
-websocket-client==1.8.0
-python-dotenv>=1.0.0
+python-binance
+pandas
+pandas-ta
+numpy
+python-dotenv
+rich
