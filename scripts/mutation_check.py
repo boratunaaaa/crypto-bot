@@ -167,8 +167,8 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
 
     # ── 9. tur ──
     ("M24", "trader.py", "Tek bayrak: karantina yazması uzlaştırma kilidini açar",
-     'if not self.reconcile_state_ok:\n            return False, "Karantina/uzlaştırma durumu okunamıyor, yeni pozisyon açılmıyor"',
-     'if False:\n            return False, "Karantina/uzlaştırma durumu okunamıyor, yeni pozisyon açılmıyor"'),
+     'if not self.reconcile_state_ok:\n            return False, "Uzlaştırma durumu okunamıyor, yeni pozisyon açılmıyor"',
+     'if False:\n            return False, "Uzlaştırma durumu okunamıyor, yeni pozisyon açılmıyor"'),
 
     ("M25", "trader.py", "Uzlaştırma yazma hatası karantina bayrağına yazılır",
      'self.reconcile_state_ok = False\n        logger.error(f"UZLAŞTIRMA KAYDI YAZILAMADI {self.reconcile_needed}")',
@@ -183,17 +183,61 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
      'net + total_comm, total_comm, net,\n                               pnl_verified=True)'),
 
     ("M28", "trader.py", "Boş gelir geçmişi 'doğrulanmış sıfır' sayılır",
-     '        if total is None:\n            # Kayıt yok: borsa henüz yazmamış olabilir. "0 kâr" DEĞİL,\n'
-     '            # "ölçemedim" demektir.\n            return None, False',
-     '        if total is None:\n            total = 0.0'),
+     'return 0.0, (not required)',
+     'return 0.0, True'),
 
-    ("M29", "trader.py", "Komisyon sorgusu hatası doğrulamayı düşürmez",
-     'verified = False\n                logger.error(f"{symbol}: {kind} okunamadı: {e}")',
-     'logger.error(f"{symbol}: {kind} okunamadı: {e}")'),
+    ("M29", "trader.py", "Gelir sorgusu hatası doğrulamayı düşürmez",
+     'rows = None\n                logger.error(f"{symbol}: {kind} okunamadı: {e}")',
+     'rows = [{"income": "0"}]\n                logger.error(f"{symbol}: {kind} okunamadı: {e}")'),
 
     ("M30", "database.py", "Eski işlemler doğrulanmış varsayılır",
      '("pnl_verified",   "INTEGER", "0"),',
      '("pnl_verified",   "INTEGER", "1"),'),
+
+    # ── 10. tur ──
+    ("M31", "trader.py", "Gelir penceresi emirden SONRA başlar",
+     'v = pos.get("income_start_ms")\n        if v:\n            return int(v)',
+     'v = None\n        if v:\n            return int(v)'),
+
+    ("M32", "trader.py", "Gelir penceresi pozisyona hiç yazılmaz",
+     'pos["income_start_ms"] = income_start_ms',
+     'pos["_unused_income_start_ms"] = income_start_ms'),
+
+    ("M33", "trader.py", "Boş komisyon doğrulanmış sayılır",
+     'comm, ok_c = self._income_sum(symbol, "COMMISSION", since_ms, required=True)',
+     'comm, ok_c = self._income_sum(symbol, "COMMISSION", since_ms, required=False)'),
+
+    ("M34", "trader.py", "Eksik komisyon tekrar sorgulanmaz",
+     'if not required:\n                break                       # boş olması normal, bekleme',
+     'if True:\n                break                       # boş olması normal, bekleme'),
+
+    ("M35", "trader.py", "Boş funding doğrulamayı düşürür (aşırı katı)",
+     'fund, ok_f = self._income_sum(symbol, "FUNDING_FEE", since_ms, required=False)',
+     'fund, ok_f = self._income_sum(symbol, "FUNDING_FEE", since_ms, required=True)'),
+
+    ("M36", "trader.py", "Dolu karantina yeni girişi durdurmaz",
+     'if self.pending_unknown:\n            return False, (f"Akıbeti bilinmeyen emir var',
+     'if False:\n            return False, (f"Akıbeti bilinmeyen emir var'),
+
+    ("M37", "trader.py", "Dolu uzlaştırma listesi yeni girişi durdurmaz",
+     'if self.reconcile_needed:\n            return False, (f"Uzlaştırma bekleyen sembol var',
+     'if False:\n            return False, (f"Uzlaştırma bekleyen sembol var'),
+
+    ("M38", "trader.py", "Korumasız pozisyon yeni girişi durdurmaz",
+     'if self.unprotected:\n            return False, (f"Korumasız pozisyon var',
+     'if False:\n            return False, (f"Korumasız pozisyon var'),
+
+    ("M39", "trader.py", "Başarılı uzlaştırma yazması kilidi açmaz",
+     'self.reconcile_state_ok = True\n                return True',
+     'return True'),
+
+    ("M40", "database.py", "Doğrulanmamış kâr risk hesabına girer",
+     'out.append(pnl if (r["v"] or pnl < 0) else 0.0)',
+     'out.append(pnl)'),
+
+    ("M41", "database.py", "Doğrulanmamış işlem günlük raporda işaretlenmez",
+     '(row["unverified"] or 0) + (0 if verified else 1),',
+     '(row["unverified"] or 0),'),
 ]
 
 

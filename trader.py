@@ -1019,6 +1019,11 @@ class FuturesTrader(ExitEngineMixin):
         """
         try:
             if state_set_many({"reconcile_needed": self.reconcile_needed}):
+                # DENETİM BULGUSU: başarılı yazmadan sonra bayrak True'ya
+                # DÖNMÜYORDU. Bir kez yazma hatası alan bot, DB düzelse bile
+                # restart'a kadar kilitli kalıyordu — güvenli tarafta ama
+                # gereksiz bir operasyonel kilitlenme.
+                self.reconcile_state_ok = True
                 return True
         except Exception as e:
             logger.error(f"UZLAŞTIRMA KAYDI YAZILAMADI {self.reconcile_needed}: {e}")
@@ -1108,14 +1113,9 @@ class FuturesTrader(ExitEngineMixin):
                       entry_snapshot=None):
         if symbol in self.positions:
             return False, "Zaten açık"
-        # Ölçemediğimiz ya da bilmediğimiz bir durumda YENİ RİSK ALINMAZ.
-        # Çıkışlar bu kapıdan geçmez; yalnız giriş durur.
-        if self.equity_stale:
-            return False, "Equity ölçülemiyor, yeni pozisyon açılmıyor"
-        if not self.pending_state_ok:
-            return False, "Karantina durumu okunamıyor, yeni pozisyon açılmıyor"
-        if not self.reconcile_state_ok:
-            return False, "Karantina/uzlaştırma durumu okunamıyor, yeni pozisyon açılmıyor"
+        allowed, why = self.can_open_new_risk()
+        if not allowed:
+            return False, why
         try:
             if not self._set_leverage(symbol, leverage):
                 return False, f"Kaldıraç ayarlanamadı ({leverage}x), pozisyon açılmadı"
@@ -1135,6 +1135,12 @@ class FuturesTrader(ExitEngineMixin):
             # Artık: benzersiz clientOrderId + RESULT cevabı + doğrulama.
             # clientOrderId sayesinde timeout sonrası emir KÖRLEMESİNE
             # tekrarlanmıyor, borsadan sorgulanıyor.
+            # DENETİM BULGUSU: gelir sorgusu `open_time`'dan başlıyordu, ama
+            # `open_time` emir GERÇEKLEŞTİKTEN ve stop kurulduktan SONRA
+            # atanıyor. Giriş emrinin komisyonu bu pencerenin DIŞINDA kalıp
+            # net PnL'e hiç girmeyebilir — üstelik sonuç "doğrulanmış"
+            # sayılırdı. Pencere emirden ÖNCE başlamalı.
+            income_start_ms = int(datetime.now().timestamp() * 1000) - 1000
             res = self._execute(symbol, side, target_qty, purpose="giriş")
             if not res.ok:
                 logger.error(f"Giriş emri gerçekleşmedi {symbol}: {res.status}")
@@ -1189,6 +1195,8 @@ class FuturesTrader(ExitEngineMixin):
             )
             if risk_amount:
                 pos["risk_amount"] = risk_amount
+            # Gelir sorgusunun başlangıcı — giriş emrinden ÖNCE alındı.
+            pos["income_start_ms"] = income_start_ms
             self.positions[symbol] = pos
 
             self.trade_log.append(dict(
@@ -1373,7 +1381,7 @@ class FuturesTrader(ExitEngineMixin):
             total_comm = (comm + pos.get("realized_commission", 0.0)
                           + pos.get("open_commission", 0.0))
             risk = pos.get("risk_amount", 0.0)
-            since_ms = int(pos["open_time"].timestamp() * 1000)
+            since_ms = self._income_since(pos)
             ex_net, verified = self._exchange_net_pnl(symbol, since_ms)
             if verified and ex_net is not None:
                 net = ex_net
@@ -1399,45 +1407,119 @@ class FuturesTrader(ExitEngineMixin):
         else:
             logger.error(f"{symbol} kapama emri gönderildi ama pozisyon hâlâ açık")
 
+    def can_open_new_risk(self) -> tuple[bool, str]:
+        """YENİ RİSK alınabilir mi? Tek merkezî kapı.
+
+        DENETİM BULGUSU: giriş yalnız DEPO SAĞLIK BAYRAKLARINA bakıyordu
+        (`pending_state_ok`, `reconcile_state_ok`) — yani "durumu okuyabildim
+        mi". Oysa asıl soru "okudum ve İÇİNDE SORUN VAR MI". Karantinada
+        akıbeti bilinmeyen bir emir dururken ya da uzlaştırma listesi doluyken
+        yeni pozisyon açılabiliyordu.
+
+        Ayrıca main.py koruma durumunu tarama başında BİR KEZ hesaplıyordu;
+        ilk aday bilinmeyen bir emir üretirse aynı taramadaki ikinci aday yine
+        açılabiliyordu. Kapı artık HER girişte, o anki duruma bakarak çalışır.
+
+        Çıkışlar bu kapıdan GEÇMEZ — yalnız yeni risk durur.
+        """
+        if self.equity_stale:
+            return False, "Equity ölçülemiyor, yeni pozisyon açılmıyor"
+        if not self.pending_state_ok:
+            return False, "Karantina durumu okunamıyor, yeni pozisyon açılmıyor"
+        if not self.reconcile_state_ok:
+            return False, "Uzlaştırma durumu okunamıyor, yeni pozisyon açılmıyor"
+        if self.pending_unknown:
+            return False, (f"Akıbeti bilinmeyen emir var ({', '.join(self.pending_unknown)}), "
+                           f"yeni pozisyon açılmıyor")
+        if self.reconcile_needed:
+            return False, (f"Uzlaştırma bekleyen sembol var ({', '.join(self.reconcile_needed)}), "
+                           f"yeni pozisyon açılmıyor")
+        if self.unprotected:
+            return False, (f"Korumasız pozisyon var ({', '.join(self.unprotected)}), "
+                           f"yeni pozisyon açılmıyor")
+        if self.orphans:
+            return False, (f"Sahipsiz pozisyon var ({', '.join(self.orphans)}), "
+                           f"yeni pozisyon açılmıyor")
+        return True, ""
+
+    # Borsa gelir kayıtları anında yerleşmeyebilir. Sınırlı tekrar sorgusu.
+    INCOME_ATTEMPTS = 3
+    INCOME_RETRY_SEC = 0.5
+
+    def _income_sum(self, symbol: str, kind: str, since_ms: int, *, required: bool):
+        """Tek gelir tipini topla.
+
+        Dönüş: (toplam, güvenilir_mi). `required=True` olan tipte KAYIT
+        BULUNAMAZSA güvenilir değildir.
+
+        DENETİM BULGUSU: boş komisyon cevabı doğrulanmış sayılıyordu.
+        Gerçekleşmiş bir giriş/çıkışta komisyon kaydının olmaması normal
+        DEĞİLDİR — Binance kayıtları gecikmeli yerleştiğinde komisyonsuz,
+        iyimser bir net PnL kaydediliyordu. Funding için boş normaldir
+        (pozisyon funding saatini görmemiş olabilir).
+        """
+        rows = None
+        for attempt in range(self.INCOME_ATTEMPTS):
+            try:
+                rows = self.client.futures_income_history(
+                    symbol=symbol, incomeType=kind, startTime=since_ms, limit=200,
+                )
+            except Exception as e:
+                rows = None
+                logger.error(f"{symbol}: {kind} okunamadı: {e}")
+            if rows:
+                break
+            if not required:
+                break                       # boş olması normal, bekleme
+            if attempt < self.INCOME_ATTEMPTS - 1:
+                time.sleep(self.INCOME_RETRY_SEC)
+        if rows:
+            try:
+                return sum(float(i["income"]) for i in rows), True
+            except (TypeError, ValueError, KeyError) as e:
+                logger.error(f"{symbol}: {kind} kaydı çözülemedi: {e}")
+                return 0.0, False
+        return 0.0, (not required)
+
+    @staticmethod
+    def _income_since(pos: dict) -> int:
+        """Gelir sorgusunun başlangıcı (ms).
+
+        DENETİM BULGUSU: `open_time` emir GERÇEKLEŞTİKTEN ve stop kurulduktan
+        sonra atanır; giriş komisyonu ondan ÖNCE yazılır. O yüzden giriş
+        komisyonu pencerenin dışında kalıp net PnL'e hiç girmeyebiliyordu —
+        üstelik sonuç "doğrulanmış" sayılıyordu.
+
+        Restart'tan gelen eski pozisyonlarda alan olmayabilir; o zaman
+        `open_time`'dan bir dakika GERİ gidilir. Pencereyi geniş tutmak,
+        komisyonu tamamen kaçırmaktan iyidir.
+        """
+        v = pos.get("income_start_ms")
+        if v:
+            return int(v)
+        return int(pos["open_time"].timestamp() * 1000) - 60_000
+
     def _exchange_net_pnl(self, symbol: str, since_ms: int):
         """Borsadan NET gerçekleşen PnL: realized + komisyon + funding.
 
-        Dönüş: (net, doğrulandı_mı). Bileşenlerden biri okunamazsa sonuç
-        DOĞRULANMIŞ SAYILMAZ — eksik bir net, iyimser bir nettir.
+        Dönüş: (net, doğrulandı_mı). Bileşenlerden biri okunamaz VEYA zorunlu
+        bir bileşen boş dönerse sonuç DOĞRULANMIŞ SAYILMAZ — eksik bir net,
+        iyimser bir nettir.
 
         DENETİM BULGUSU: bu sorgu yalnız borsa-stop senkronizasyonunda
         yapılıyordu. Normal ve acil kapanışlar net PnL'i YEREL tahminle
-        (sabit COMMISSION_RATE, funding yok) hesaplayıp `pnl_verified=True`
-        yazıyordu; yani doğrulanmamış sayılar go-live örneklemine gerçek
-        ölçüm gibi giriyordu.
+        (sabit COMMISSION_RATE, funding yok) hesaplayıp doğrulanmış
+        yazıyordu.
         """
-        total, verified = None, True
-        try:
-            rows = self.client.futures_income_history(
-                symbol=symbol, incomeType="REALIZED_PNL",
-                startTime=since_ms, limit=50,
-            )
-            if rows:
-                total = sum(float(i["income"]) for i in rows)
-        except Exception as e:
-            logger.error(f"{symbol}: gerçekleşen PnL okunamadı: {e}")
+        realized, ok_r = self._income_sum(symbol, "REALIZED_PNL", since_ms, required=True)
+        if not ok_r:
+            logger.error(f"{symbol}: gerçekleşen PnL kaydı bulunamadı — doğrulanmadı")
             return None, False
-        if total is None:
-            # Kayıt yok: borsa henüz yazmamış olabilir. "0 kâr" DEĞİL,
-            # "ölçemedim" demektir.
-            return None, False
-        for kind in ("COMMISSION", "FUNDING_FEE"):
-            try:
-                rows = self.client.futures_income_history(
-                    symbol=symbol, incomeType=kind,
-                    startTime=since_ms, limit=50,
-                )
-                if rows:
-                    total += sum(float(i["income"]) for i in rows)
-            except Exception as e:
-                verified = False
-                logger.error(f"{symbol}: {kind} okunamadı: {e}")
-        return total, verified
+        comm, ok_c = self._income_sum(symbol, "COMMISSION", since_ms, required=True)
+        fund, ok_f = self._income_sum(symbol, "FUNDING_FEE", since_ms, required=False)
+        if not ok_c:
+            logger.error(f"{symbol}: komisyon kaydı bulunamadı — net PnL doğrulanmadı")
+        return realized + comm + fund, bool(ok_c and ok_f)
 
     def _position_amount(self, symbol: str) -> float:
         try:
@@ -1537,7 +1619,7 @@ class FuturesTrader(ExitEngineMixin):
             # Borsadan doğrula. Doğrulanırsa borsanın NET'i esas alınır
             # (gerçek komisyon + funding içerir); doğrulanamazsa yerel tahmin
             # kalır ama işlem DOĞRULANMAMIŞ olarak kaydedilir.
-            since_ms = int(pos["open_time"].timestamp() * 1000)
+            since_ms = self._income_since(pos)
             ex_net, verified = self._exchange_net_pnl(symbol, since_ms)
             if verified and ex_net is not None:
                 self.total_pnl += ex_net - total_net
@@ -1742,7 +1824,7 @@ class FuturesTrader(ExitEngineMixin):
                     pnl = None
                     pnl_verified = True
                     close_px = pos["entry_price"]
-                    since = int(pos["open_time"].timestamp() * 1000)
+                    since = self._income_since(pos)
                     try:
                         income = self.client.futures_income_history(
                             symbol=sym, incomeType="REALIZED_PNL",

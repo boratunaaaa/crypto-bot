@@ -90,7 +90,12 @@ CREATE TABLE IF NOT EXISTS daily_stats (
     win_rate      REAL,
     profit_factor REAL,
     max_win       REAL,
-    max_loss      REAL
+    max_loss      REAL,
+    -- DENETİM BULGUSU: doğrulanmamış PnL bu tabloya karışıyordu ve günlük
+    -- rapor tahminleri ölçüm gibi gösteriyordu. DIŞLAMIYORUZ — zararı
+    -- dışlamak raporu iyimser yapardı — ama kaç tanesinin doğrulanmadığını
+    -- SAYIYORUZ ki rapor kendi güvenilirliğini beyan edebilsin.
+    unverified    INTEGER DEFAULT 0
 );
 
 -- Kalıcı bot state'i. Restart sonrası equity/kill-switch/risk bütçesi buradan gelir.
@@ -176,6 +181,9 @@ _TRADE_COLUMNS = [
 ]
 
 
+_DAILY_COLUMNS = [("unverified", "INTEGER", "0")]
+
+
 def _migrate(con):
     # Eski veritabanlarında `mode` sütunu yok.
     try:
@@ -195,6 +203,15 @@ def _migrate(con):
             added.append(name)
     if added:
         logger.info(f"Migration: trades tablosuna {len(added)} kolon eklendi: {', '.join(added)}")
+    try:
+        have = {r["name"] for r in con.execute("PRAGMA table_info(daily_stats)")}
+        for name, sqltype, default in _DAILY_COLUMNS:
+            if name not in have:
+                con.execute(
+                    f"ALTER TABLE daily_stats ADD COLUMN {name} {sqltype} DEFAULT {default}"
+                )
+    except Exception as e:
+        logger.error(f"daily_stats migration hatası: {e}")
     return added
 
 
@@ -382,12 +399,14 @@ def save_trade(
                 _mode(),
                 1 if pnl_verified else 0,
             ))
-        _update_daily_stats(close_time.date(), net_pnl, commission, gross_pnl)
+        _update_daily_stats(close_time.date(), net_pnl, commission, gross_pnl,
+                            verified=bool(pnl_verified))
     except Exception as e:
         logger.error(f"Trade kaydedilemedi: {e}")
 
 
-def _update_daily_stats(stat_date: date, net_pnl: float, commission: float, gross_pnl: float):
+def _update_daily_stats(stat_date: date, net_pnl: float, commission: float,
+                        gross_pnl: float, verified: bool = True):
     try:
         with _conn() as con:
             row = con.execute(
@@ -397,8 +416,9 @@ def _update_daily_stats(stat_date: date, net_pnl: float, commission: float, gros
                 con.execute("""
                     INSERT INTO daily_stats
                     (stat_date, num_trades, wins, losses, gross_pnl, commission,
-                     net_pnl, win_rate, profit_factor, max_win, max_loss)
-                    VALUES (?,1,?,?,?,?,?,?,?,?,?)
+                     net_pnl, win_rate, profit_factor, max_win, max_loss,
+                     unverified)
+                    VALUES (?,1,?,?,?,?,?,?,?,?,?,?)
                 """, (
                     str(stat_date),
                     1 if net_pnl >= 0 else 0,
@@ -409,6 +429,7 @@ def _update_daily_stats(stat_date: date, net_pnl: float, commission: float, gros
                     0.0,
                     net_pnl if net_pnl >= 0 else 0,
                     net_pnl if net_pnl < 0  else 0,
+                    0 if verified else 1,
                 ))
             else:
                 nt  = row["num_trades"] + 1
@@ -425,9 +446,12 @@ def _update_daily_stats(stat_date: date, net_pnl: float, commission: float, gros
                 con.execute("""
                     UPDATE daily_stats SET
                     num_trades=?, wins=?, losses=?, gross_pnl=?, commission=?,
-                    net_pnl=?, win_rate=?, profit_factor=?, max_win=?, max_loss=?
+                    net_pnl=?, win_rate=?, profit_factor=?, max_win=?, max_loss=?,
+                    unverified=?
                     WHERE stat_date=?
-                """, (nt, w, l, gp, com, np_, wr, pf, mw, ml, str(stat_date)))
+                """, (nt, w, l, gp, com, np_, wr, pf, mw, ml,
+                      (row["unverified"] or 0) + (0 if verified else 1),
+                      str(stat_date)))
     except Exception as e:
         logger.error(f"Daily stats güncellenemedi: {e}")
 
@@ -543,13 +567,27 @@ def get_daily_report(days: int = 7) -> list[dict]:
 
 
 def get_recent_pnls(n: int = 30) -> list[float]:
-    """Dinamik risk hesabı için son N işlemin net PnL'i (restart'a dayanıklı)."""
+    """Dinamik risk hesabı için son N işlemin net PnL'i (restart'a dayanıklı).
+
+    DENETİM BULGUSU: doğrulanmamış PnL go-live örnekleminden çıkarılıyordu ama
+    BU LİSTEYE giriyordu ve dinamik pozisyon riskini belirliyordu. Yani
+    borsadan doğrulanmamış bir "kâr", bir sonraki işlemin riskini ARTIRABİLİYORDU.
+
+    Kural: doğrulanmamış sonuç riski AZALTMAK için kullanılabilir, ARTIRMAK
+    için kullanılamaz. Doğrulanmamış KÂR görmezden gelinir (0 sayılır),
+    doğrulanmamış ZARAR olduğu gibi kalır — muhafazakâr yön budur.
+    """
     try:
         with _conn() as con:
             rows = con.execute(
-                "SELECT net_pnl FROM trades ORDER BY id DESC LIMIT ?", (n,)
+                "SELECT net_pnl, COALESCE(pnl_verified, 0) AS v "
+                "FROM trades ORDER BY id DESC LIMIT ?", (n,)
             ).fetchall()
-            return [r["net_pnl"] for r in reversed(rows)]
+            out = []
+            for r in reversed(rows):
+                pnl = r["net_pnl"] or 0.0
+                out.append(pnl if (r["v"] or pnl < 0) else 0.0)
+            return out
     except Exception:
         return []
 

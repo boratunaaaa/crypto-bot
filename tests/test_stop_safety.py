@@ -1655,7 +1655,7 @@ def test_corrupt_reconcile_state_blocks_new_entries_at_startup():
     assert t.reconcile_state_ok is False, "karantina yazması uzlaştırma kilidini açtı"
     ok, msg = t.open_position("TESTUSDT", "BUY", 100.0, 50.0, 3, 98.0, 107.0,
                               qty=1.0, risk_amount=2.0)
-    assert ok is False and "Karantina" in msg
+    assert ok is False and "zlaştırma" in msg
 
 
 # ── 9. denetim turu ───────────────────────────────────────────────────────────
@@ -1678,7 +1678,7 @@ def test_quarantine_write_does_not_unlock_reconcile_gate():
     ok, msg = t.open_position("TESTUSDT", "BUY", 100.0, 50.0, 3, 98.0, 107.0,
                               qty=1.0, risk_amount=2.0)
     assert ok is False, "uzlaştırma durumu bilinmezken pozisyon açıldı"
-    assert "uzlaştırma" in msg
+    assert "zlaştırma" in msg
 
 
 def test_normal_close_is_unverified_without_exchange_income():
@@ -1796,7 +1796,7 @@ def test_reconcile_write_failure_locks_its_own_flag():
 
     ok, msg = t.open_position("TESTUSDT", "BUY", 100.0, 50.0, 3, 98.0, 107.0,
                               qty=1.0, risk_amount=2.0)
-    assert ok is False and "uzlaştırma" in msg
+    assert ok is False and "zlaştırma" in msg
 
 
 def test_legacy_trades_are_not_assumed_verified():
@@ -1820,3 +1820,198 @@ def test_legacy_trades_are_not_assumed_verified():
         database._migrate(con)              # kolon şimdi ekleniyor
         row = dict(con.execute("SELECT pnl_verified FROM trades").fetchone())
     assert row["pnl_verified"] == 0, "eski işlem doğrulanmış varsayıldı"
+
+
+# ── 10. denetim turu ──────────────────────────────────────────────────────────
+
+def test_income_window_starts_before_entry_order():
+    """
+    DENETİM BULGUSU: gelir sorgusu `open_time`'dan başlıyordu, ama `open_time`
+    emir GERÇEKLEŞTİKTEN ve stop kurulduktan SONRA atanıyor. Giriş emrinin
+    komisyonu bu pencerenin dışında kalıp net PnL'e hiç girmeyebilirdi —
+    üstelik sonuç "doğrulanmış" sayılırdı.
+    """
+    t = _trader()
+    ok, _ = t.open_position("TESTUSDT", "BUY", 100.0, 50.0, 3, 98.0, 107.0,
+                            qty=1.0, risk_amount=2.0)
+    assert ok
+    pos = t.positions["TESTUSDT"]
+    assert "income_start_ms" in pos, "gelir penceresi hiç kaydedilmedi"
+    assert pos["income_start_ms"] < int(pos["open_time"].timestamp() * 1000), \
+        "pencere emirden önce değil, sonra başlıyor"
+
+    # Asıl kanıt: sorgu penceresi KAYDEDİLEN değeri kullanmalı. Yalnız
+    # "open_time'dan küçük" demek yetmez — geri düşüş yolu da onu sağlar.
+    assert t._income_since(pos) == pos["income_start_ms"], \
+        "kaydedilen pencere kullanılmadı, varsayılana düşüldü"
+
+    # Eski (restart'tan gelen) pozisyonda alan yoksa pencere GENİŞ olmalı.
+    legacy = _pos()
+    assert t._income_since(legacy) < int(legacy["open_time"].timestamp() * 1000), \
+        "eski pozisyonda pencere geriye alınmadı"
+
+
+def test_empty_commission_record_is_not_verified():
+    """
+    DENETİM BULGUSU: boş komisyon cevabı doğrulanmış sayılıyordu.
+    Gerçekleşmiş bir giriş/çıkışta komisyon kaydının olmaması NORMAL DEĞİLDİR;
+    Binance kayıtları gecikmeli yerleşirse komisyonsuz, iyimser bir PnL
+    kaydedilirdi.
+    """
+    t = _trader()
+    t.INCOME_RETRY_SEC = 0
+
+    def income(**kw):
+        return [{"income": "7.0"}] if kw.get("incomeType") == "REALIZED_PNL" else []
+
+    t.client.futures_income_history.side_effect = income
+    net, verified = t._exchange_net_pnl("TESTUSDT", 0)
+    assert verified is False, f"komisyonsuz sonuç doğrulanmış sayıldı: {net}"
+
+
+def test_missing_commission_is_retried_before_giving_up():
+    """Gelir kayıtları gecikmeli yerleşebilir — tek sorguda pes edilmemeli."""
+    t = _trader()
+    t.INCOME_RETRY_SEC = 0
+    calls = {"COMMISSION": 0}
+
+    def income(**kw):
+        k = kw.get("incomeType")
+        if k == "REALIZED_PNL":
+            return [{"income": "7.0"}]
+        if k == "COMMISSION":
+            calls["COMMISSION"] += 1
+            return [{"income": "-1.0"}] if calls["COMMISSION"] >= 2 else []
+        return []
+
+    t.client.futures_income_history.side_effect = income
+    net, verified = t._exchange_net_pnl("TESTUSDT", 0)
+    assert calls["COMMISSION"] >= 2, "komisyon tekrar sorgulanmadı"
+    assert verified is True and net == pytest.approx(6.0)
+
+
+def test_empty_funding_record_is_normal():
+    """Funding kaydının boş olması normaldir — pozisyon funding saatini
+    görmemiş olabilir. Bunu doğrulama düşürücü saymak yanlış olur."""
+    t = _trader()
+    t.INCOME_RETRY_SEC = 0
+
+    def income(**kw):
+        return {"REALIZED_PNL": [{"income": "7.0"}],
+                "COMMISSION":   [{"income": "-1.0"}]}.get(kw.get("incomeType"), [])
+
+    t.client.futures_income_history.side_effect = income
+    net, verified = t._exchange_net_pnl("TESTUSDT", 0)
+    assert verified is True, "boş funding doğrulamayı düşürdü"
+    assert net == pytest.approx(6.0)
+
+
+def test_pending_order_blocks_new_position():
+    """
+    DENETİM BULGUSU: giriş yalnız depo SAĞLIK bayraklarına bakıyordu ("durumu
+    okuyabildim mi"), içinde SORUN OLUP OLMADIĞINA bakmıyordu. Karantinada
+    akıbeti bilinmeyen bir emir dururken başka sembolde pozisyon açılabiliyordu.
+    """
+    t = _trader()
+    t.pending_unknown["OTHERUSDT"] = {"coid": "x", "side": "BUY", "qty": 1.0,
+                                      "reduce_only": False, "purpose": "giriş", "ts": 0}
+    before = t.client.futures_create_order.call_count
+
+    ok, msg = t.open_position("TESTUSDT", "BUY", 100.0, 50.0, 3, 98.0, 107.0,
+                              qty=1.0, risk_amount=2.0)
+    assert ok is False, "akıbeti bilinmeyen emir varken yeni pozisyon açıldı"
+    assert "bilinmeyen" in msg
+    assert t.client.futures_create_order.call_count == before
+
+
+def test_reconcile_backlog_blocks_new_position():
+    """Uzlaştırma bekleyen sembol varken kayıt ile borsa ayrışmıştır —
+    pozisyon boyutu ve risk hesabı güvenilmez."""
+    t = _trader()
+    t.reconcile_needed["OTHERUSDT"] = "işlenmemiş dolum"
+    ok, msg = t.open_position("TESTUSDT", "BUY", 100.0, 50.0, 3, 98.0, 107.0,
+                              qty=1.0, risk_amount=2.0)
+    assert ok is False and "zlaştırma" in msg
+
+
+def test_gate_is_rechecked_for_every_candidate():
+    """
+    DENETİM BULGUSU: ana döngü koruma durumunu tarama başında BİR KEZ
+    hesaplıyordu. İlk aday bilinmeyen bir emir üretirse aynı taramadaki
+    ikinci aday hâlâ açılabiliyordu. Kapı her girişte yeniden çalışmalı.
+    """
+    t = _trader()
+    assert t.can_open_new_risk()[0] is True
+
+    # İlk aday sorun üretti
+    t.unprotected["AUSDT"] = "stop kurulamadı"
+    ok, msg = t.open_position("BUSDT", "BUY", 100.0, 50.0, 3, 98.0, 107.0,
+                              qty=1.0, risk_amount=2.0)
+    assert ok is False, "ilk adaydan sonra ikinci aday yine açıldı"
+    assert "Korumasız" in msg
+
+
+def test_successful_reconcile_write_clears_the_lock():
+    """
+    Bir kez yazma hatası alan bot, DB düzelse bile restart'a kadar kilitli
+    kalıyordu. Güvenli tarafta ama gereksiz operasyonel kilitlenme.
+    """
+    import database
+    t = _trader()
+    with patch.object(database, "_conn", side_effect=sqlite3.OperationalError("bozuk")):
+        t._save_reconcile()
+    assert t.reconcile_state_ok is False
+
+    t._save_reconcile()                    # DB düzeldi
+    assert t.reconcile_state_ok is True, "yazma düzeldiği hâlde kilit açılmadı"
+
+
+def test_unverified_profit_cannot_raise_risk():
+    """
+    DENETİM BULGUSU: doğrulanmamış PnL go-live örnekleminden çıkarılıyordu ama
+    `get_recent_pnls()` onu okuyordu ve o değer dinamik pozisyon riskini
+    belirliyordu — yani doğrulanmamış bir "kâr" bir sonraki işlemin riskini
+    ARTIRABİLİYORDU.
+    """
+    import datetime as dt
+    import database
+    base = dict(
+        symbol="TESTUSDT", side="BUY", entry_price=100.0, close_price=101.0,
+        margin=33.0, leverage=3, gross_pnl=1.0, commission=0.1,
+        reason_open="t", reason_close="TP",
+        open_time=dt.datetime(2026, 8, 13, 10, 0),
+        close_time=dt.datetime(2026, 8, 13, 12, 0),
+    )
+    database.save_trade(**{**base, "net_pnl": 50.0}, pnl_verified=False)   # kâr
+    database.save_trade(**{**base, "net_pnl": -20.0}, pnl_verified=False)  # zarar
+    database.save_trade(**{**base, "net_pnl": 10.0}, pnl_verified=True)
+
+    pnls = database.get_recent_pnls(10)
+    assert 50.0 not in pnls, "doğrulanmamış kâr risk hesabına girdi"
+    assert -20.0 in pnls, "doğrulanmamış ZARAR görmezden gelindi (iyimser yön)"
+    assert 10.0 in pnls, "doğrulanmış işlem düştü"
+
+
+def test_daily_stats_flags_unverified_trades():
+    """Doğrulanmamış işlem günlük istatistikten DIŞLANMAZ — zararı dışlamak
+    raporu iyimser yapardı — ama sayılır ki rapor kendi güvenilirliğini
+    beyan edebilsin."""
+    import datetime as dt
+    import database
+    base = dict(
+        symbol="TESTUSDT", side="BUY", entry_price=100.0, close_price=101.0,
+        margin=33.0, leverage=3, gross_pnl=1.0, commission=0.1, net_pnl=-5.0,
+        reason_open="t", reason_close="STOP",
+        open_time=dt.datetime(2026, 8, 13, 10, 0),
+        close_time=dt.datetime(2026, 8, 13, 12, 0),
+    )
+    # SIRA ÖNEMLİ: doğrulanmış olan ÖNCE gitmeli (INSERT yolu), doğrulanmamış
+    # SONRA (UPDATE yolu). Tersi olursa sayaç INSERT'te doğru kurulur ve
+    # UPDATE yolundaki artırma hiç ölçülmez.
+    database.save_trade(**base, pnl_verified=True)
+    database.save_trade(**base, pnl_verified=False)
+
+    with database._conn() as con:
+        row = dict(con.execute("SELECT num_trades, unverified FROM daily_stats").fetchone())
+    assert row["num_trades"] == 2, "işlem dışlandı — zarar raporda kayboldu"
+    assert row["unverified"] == 1, "doğrulanmamış işlem UPDATE yolunda işaretlenmedi"
