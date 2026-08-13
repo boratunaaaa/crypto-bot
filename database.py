@@ -166,9 +166,13 @@ _TRADE_COLUMNS = [
     ("exit_detail",    "TEXT",    "''"),
     ("entry_snapshot", "TEXT",    "''"),
     ("funding_cost",   "REAL",    "0"),
-    # Kapanış PnL'i borsadan DOĞRULANDI mı. 0 = muhafazakâr tahmin kullanıldı.
-    # Go-live ölçümü tahminleri gerçek işlem gibi saymamalı.
-    ("pnl_verified",   "INTEGER", "1"),
+    # Kapanış PnL'i borsadan DOĞRULANDI mı. 0 = doğrulanmadı.
+    # Go-live ölçümü doğrulanmamış işlemleri örnekleme katmaz.
+    #
+    # DEFAULT 0 BİLEREK: migration ile gelen ESKİ satırlar bu doğrulamadan
+    # hiç geçmemiştir; onları 1 saymak, hiç yapılmamış bir kontrolü yapılmış
+    # gibi göstermek olur. Yeni satırlar değeri her zaman açıkça yazar.
+    ("pnl_verified",   "INTEGER", "0"),
 ]
 
 

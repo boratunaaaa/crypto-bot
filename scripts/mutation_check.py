@@ -150,12 +150,12 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
      '                self._save_pending()\n            else:'),
 
     ("M20", "trader.py", "Uzlaştırma restart'ta yüklenmez",
-     'self.reconcile_needed, _rec_ok = _load_reconcile()',
-     'self.reconcile_needed, _rec_ok = {}, True'),
+     'self.reconcile_needed, self.reconcile_state_ok = _load_reconcile()',
+     'self.reconcile_needed, self.reconcile_state_ok = {}, True'),
 
-    ("M23", "trader.py", "Uzlaştırma okunamazken giriş serbest",
-     'if not _rec_ok:\n            self.pending_state_ok = False',
-     'if False:\n            self.pending_state_ok = False'),
+    ("M23", "trader.py", "Uzlaştırma okuma hatası güvenilir sayılır",
+     'logger.error(f"UZLAŞTIRMA LİSTESİ OKUNAMADI: {e}")\n        return {}, False',
+     'logger.error(f"UZLAŞTIRMA LİSTESİ OKUNAMADI: {e}")\n        return {}, True'),
 
     ("M21", "trader.py", "Doğrulanmamış PnL DB'ye doğrulanmış yazılır",
      'pnl_verified=pnl_verified,\n            )',
@@ -164,6 +164,36 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     ("M22", "go_live_check.py", "Doğrulanmamış işlemler örnekleme katılır",
      'trades = [t for t in all_rows if _verified(t)]',
      'trades = list(all_rows)'),
+
+    # ── 9. tur ──
+    ("M24", "trader.py", "Tek bayrak: karantina yazması uzlaştırma kilidini açar",
+     'if not self.reconcile_state_ok:\n            return False, "Karantina/uzlaştırma durumu okunamıyor, yeni pozisyon açılmıyor"',
+     'if False:\n            return False, "Karantina/uzlaştırma durumu okunamıyor, yeni pozisyon açılmıyor"'),
+
+    ("M25", "trader.py", "Uzlaştırma yazma hatası karantina bayrağına yazılır",
+     'self.reconcile_state_ok = False\n        logger.error(f"UZLAŞTIRMA KAYDI YAZILAMADI {self.reconcile_needed}")',
+     'self.pending_state_ok = False\n        logger.error(f"UZLAŞTIRMA KAYDI YAZILAMADI {self.reconcile_needed}")'),
+
+    ("M26", "trader.py", "Normal kapanış her hâlükârda doğrulanmış sayılır",
+     'pnl_verified=bool(verified and ex_net is not None))\n            self._persist_positions()',
+     'pnl_verified=True)\n            self._persist_positions()'),
+
+    ("M27", "trader.py", "Acil kapanış her hâlükârda doğrulanmış sayılır",
+     'net + total_comm, total_comm, net,\n                               pnl_verified=bool(verified and ex_net is not None))',
+     'net + total_comm, total_comm, net,\n                               pnl_verified=True)'),
+
+    ("M28", "trader.py", "Boş gelir geçmişi 'doğrulanmış sıfır' sayılır",
+     '        if total is None:\n            # Kayıt yok: borsa henüz yazmamış olabilir. "0 kâr" DEĞİL,\n'
+     '            # "ölçemedim" demektir.\n            return None, False',
+     '        if total is None:\n            total = 0.0'),
+
+    ("M29", "trader.py", "Komisyon sorgusu hatası doğrulamayı düşürmez",
+     'verified = False\n                logger.error(f"{symbol}: {kind} okunamadı: {e}")',
+     'logger.error(f"{symbol}: {kind} okunamadı: {e}")'),
+
+    ("M30", "database.py", "Eski işlemler doğrulanmış varsayılır",
+     '("pnl_verified",   "INTEGER", "0"),',
+     '("pnl_verified",   "INTEGER", "1"),'),
 ]
 
 

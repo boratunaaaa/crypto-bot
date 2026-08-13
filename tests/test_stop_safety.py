@@ -43,6 +43,9 @@ def _trader(tick="0.01"):
         }
         cl.futures_cancel_order.return_value = {}
         cl.futures_account_balance.return_value = [{"asset": "USDT", "balance": "1000.0"}]
+        # Gerçekçi varsayılan: borsa gelir kaydı yok. Çıplak MagicMock boş
+        # iterasyon verdiği için "doğrulanmış sıfır PnL" gibi görünüyordu.
+        cl.futures_income_history.return_value = []
         t = FuturesTrader()
         t.balance = 1000.0
         t.SETTLE_DELAY_SEC = 0        # testlerde gerçek beklemeye gerek yok
@@ -1644,8 +1647,176 @@ def test_corrupt_reconcile_state_blocks_new_entries_at_startup():
         )
 
     t = _trader()
-    assert t.pending_state_ok is False, \
+    assert t.reconcile_state_ok is False, \
         "uzlaştırma kaydı okunamadığı hâlde durum 'temiz' sayıldı"
+    # DENETİM BULGUSU: tek bayrak kullanılırken, BAŞARILI bir karantina
+    # yazması uzlaştırmanın durumu hâlâ bilinmezken giriş kilidini açıyordu.
+    t._save_pending()
+    assert t.reconcile_state_ok is False, "karantina yazması uzlaştırma kilidini açtı"
     ok, msg = t.open_position("TESTUSDT", "BUY", 100.0, 50.0, 3, 98.0, 107.0,
                               qty=1.0, risk_amount=2.0)
     assert ok is False and "Karantina" in msg
+
+
+# ── 9. denetim turu ───────────────────────────────────────────────────────────
+
+def test_quarantine_write_does_not_unlock_reconcile_gate():
+    """
+    DENETİM BULGUSU: `pending_state_ok` iki ayrı deponun (karantina ve
+    uzlaştırma) sağlığını tek bayrakta temsil ediyordu. Uzlaştırma bozulunca
+    bayrak False oluyor, ama sonraki BAŞARILI bir `_save_pending()` onu
+    tekrar True yapıyordu — uzlaştırmanın durumu hâlâ bilinmezken giriş
+    kilidi açılıyordu. İki depo, iki bayrak.
+    """
+    t = _trader()
+    t.reconcile_state_ok = False          # uzlaştırma deposu bilinmiyor
+    t._save_pending()                     # karantina yazması BAŞARILI
+
+    assert t.pending_state_ok is True, "karantina yazması başarısız sayıldı"
+    assert t.reconcile_state_ok is False, "başarılı karantina yazması diğer kilidi açtı"
+
+    ok, msg = t.open_position("TESTUSDT", "BUY", 100.0, 50.0, 3, 98.0, 107.0,
+                              qty=1.0, risk_amount=2.0)
+    assert ok is False, "uzlaştırma durumu bilinmezken pozisyon açıldı"
+    assert "uzlaştırma" in msg
+
+
+def test_normal_close_is_unverified_without_exchange_income():
+    """
+    DENETİM BULGUSU: yalnız borsa-stop senkronizasyonu `pnl_verified`
+    geçiriyordu. Normal kapanış net PnL'i YEREL tahminle (sabit komisyon
+    oranı, funding yok) hesaplayıp doğrulanmış olarak kaydediyordu; bu
+    işlemler go-live örneklemine gerçek ölçüm gibi giriyordu.
+    """
+    import database
+    t = _trader()
+    pos = _pos()
+    t.positions["TESTUSDT"] = pos
+    t.client.futures_position_information.return_value = []
+    t.client.futures_income_history.return_value = []      # borsa kaydı yok
+
+    ok, _ = t.close_position("TESTUSDT", 101.0, reason="MANUAL")
+    assert ok
+
+    with database._conn() as con:
+        rows = [dict(r) for r in con.execute("SELECT pnl_verified, reason_close FROM trades")]
+    assert rows, "kapanış kaydedilmedi"
+    assert rows[-1]["pnl_verified"] == 0, \
+        "borsadan doğrulanmadan kapanış 'doğrulanmış' yazıldı"
+    assert "TESTUSDT" in t.pnl_unverified
+
+
+def test_normal_close_uses_exchange_net_when_available():
+    """Borsa net'i okunabiliyorsa yerel tahmin değil O esas alınmalı —
+    gerçek komisyon ve funding'i içeren tek sayı odur."""
+    import database
+    t = _trader()
+    t.positions["TESTUSDT"] = _pos()
+    t.client.futures_position_information.return_value = []
+
+    def income(**kw):
+        return {"REALIZED_PNL": [{"income": "7.0"}],
+                "COMMISSION":   [{"income": "-1.0"}],
+                "FUNDING_FEE":  [{"income": "-0.5"}]}.get(kw.get("incomeType"), [])
+
+    t.client.futures_income_history.side_effect = income
+    ok, net = t.close_position("TESTUSDT", 101.0, reason="MANUAL")
+    assert ok
+    assert net == pytest.approx(5.5), f"borsa net'i (5.5) yerine {net} kullanıldı"
+
+    with database._conn() as con:
+        rows = [dict(r) for r in con.execute("SELECT pnl_verified, net_pnl FROM trades")]
+    assert rows[-1]["pnl_verified"] == 1
+    assert rows[-1]["net_pnl"] == pytest.approx(5.5)
+
+
+def test_emergency_close_is_unverified_without_exchange_income():
+    """Acil kapanış da aynı kurala tabi — hatta daha çok, çünkü o an
+    zaten bir şeyler ters gitmiştir."""
+    import database
+    t = _trader()
+    pos = _pos(stop=98.0)
+    t.positions["TESTUSDT"] = pos
+    t.client.futures_get_order.side_effect = _api_error(-2013)
+    t.client.futures_position_information.return_value = []
+    t.client.futures_income_history.return_value = []
+
+    def create(**kw):
+        if kw.get("type") == "STOP_MARKET":
+            raise _api_error(-2021)
+        return {"orderId": 9, "executedQty": "1.0", "avgPrice": "94.0"}
+
+    t.client.futures_create_order.side_effect = create
+    t._sync_protective_stop(pos)
+
+    with database._conn() as con:
+        rows = [dict(r) for r in con.execute(
+            "SELECT pnl_verified FROM trades WHERE reason_close='EMERGENCY_CLOSE'")]
+    assert rows, "acil kapanış kaydedilmedi"
+    assert rows[-1]["pnl_verified"] == 0, \
+        "acil kapanış borsadan doğrulanmadan 'doğrulanmış' yazıldı"
+
+
+def test_partial_income_query_failure_marks_close_unverified():
+    """Realized okunup komisyon okunamazsa sonuç EKSİKTİR — doğrulanmış değil."""
+    import database
+    t = _trader()
+    t.positions["TESTUSDT"] = _pos()
+    t.client.futures_position_information.return_value = []
+
+    def income(**kw):
+        if kw.get("incomeType") == "REALIZED_PNL":
+            return [{"income": "7.0"}]
+        raise TimeoutError("komisyon okunamadı")
+
+    t.client.futures_income_history.side_effect = income
+    t.close_position("TESTUSDT", 101.0, reason="MANUAL")
+
+    with database._conn() as con:
+        rows = [dict(r) for r in con.execute("SELECT pnl_verified FROM trades")]
+    assert rows[-1]["pnl_verified"] == 0, "eksik bileşenli net doğrulanmış sayıldı"
+
+
+def test_reconcile_write_failure_locks_its_own_flag():
+    """
+    Uzlaştırma YAZMA hatası kendi bayrağına yazılmalı. Karantina bayrağına
+    yazılırsa, sonraki başarılı bir karantina yazması kilidi açar — bu tam
+    olarak ayrılan iki bayrağın engellemesi gereken durumdur.
+    """
+    import database
+    t = _trader()
+    t.reconcile_needed["TESTUSDT"] = "işlenmemiş dolum"
+    with patch.object(database, "_conn", side_effect=sqlite3.OperationalError("bozuk")):
+        assert t._save_reconcile() is False
+
+    t._save_pending()                      # DB tekrar sağlam, karantina yazıldı
+    assert t.pending_state_ok is True
+    assert t.reconcile_state_ok is False, \
+        "uzlaştırma yazma hatası karantina bayrağına yazıldı"
+
+    ok, msg = t.open_position("TESTUSDT", "BUY", 100.0, 50.0, 3, 98.0, 107.0,
+                              qty=1.0, risk_amount=2.0)
+    assert ok is False and "uzlaştırma" in msg
+
+
+def test_legacy_trades_are_not_assumed_verified():
+    """
+    Migration ile gelen eski satırlar bu doğrulamadan hiç geçmemiştir.
+    Onları 'doğrulanmış' saymak, yapılmamış bir kontrolü yapılmış göstermek
+    olur ve go-live örneklemini eski veriyle şişirir.
+    """
+    import database
+    with database._conn() as con:
+        # `pnl_verified` kolonu OLMAYAN eski şemayı yeniden kur.
+        con.execute("DROP TABLE trades")
+        con.executescript(database._SCHEMA)
+        assert "pnl_verified" not in {
+            r[1] for r in con.execute("PRAGMA table_info(trades)")
+        }, "eski şema zaten kolonu içeriyor, test anlamsız"
+        con.execute(
+            "INSERT INTO trades (symbol, side, net_pnl, close_time) VALUES (?,?,?,?)",
+            ("OLDUSDT", "BUY", 5.0, "2026-08-13T12:00:00"),
+        )
+        database._migrate(con)              # kolon şimdi ekleniyor
+        row = dict(con.execute("SELECT pnl_verified FROM trades").fetchone())
+    assert row["pnl_verified"] == 0, "eski işlem doğrulanmış varsayıldı"

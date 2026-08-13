@@ -696,9 +696,12 @@ class FuturesTrader(ExitEngineMixin):
         self.pending_unknown, self.pending_state_ok = _load_pending_unknown()
         # Borsada gerçekleşmiş ama yerel kayda işlenmemiş dolumlar. Kayıt ile
         # borsa ayrıştığı için pozisyon boyutu güvenilmez → İŞLEM DURUR.
-        self.reconcile_needed, _rec_ok = _load_reconcile()
-        if not _rec_ok:
-            self.pending_state_ok = False
+        # DENETİM BULGUSU: tek bayrak iki ayrı deponun sağlığını temsil
+        # ediyordu. Uzlaştırma deposu bozukken bayrak False oluyor, ama
+        # sonraki BAŞARILI bir karantina yazması onu tekrar True yapıyordu —
+        # uzlaştırmanın durumu hâlâ bilinmezken giriş kilidi açılıyordu.
+        # İki depo, iki bayrak; giriş için İKİSİ de True olmalı.
+        self.reconcile_needed, self.reconcile_state_ok = _load_reconcile()
         # Kapanış PnL'i doğrulanamayan işlemler. Bunlar işlemi DURDURMAZ:
         # muhafazakâr değer zaten kill switch'e gidiyor, üstüne bir de kalıcı
         # duruş koymak geçici bir sorgu hatasını tam kesintiye çevirirdi.
@@ -1021,7 +1024,7 @@ class FuturesTrader(ExitEngineMixin):
             logger.error(f"UZLAŞTIRMA KAYDI YAZILAMADI {self.reconcile_needed}: {e}")
         # Kalıcı yazamıyorsak karantinayı da SİLMEYİZ: en azından bekleyen
         # kayıt üzerinden koruma devam eder.
-        self.pending_state_ok = False
+        self.reconcile_state_ok = False
         logger.error(f"UZLAŞTIRMA KAYDI YAZILAMADI {self.reconcile_needed}")
         return False
 
@@ -1111,6 +1114,8 @@ class FuturesTrader(ExitEngineMixin):
             return False, "Equity ölçülemiyor, yeni pozisyon açılmıyor"
         if not self.pending_state_ok:
             return False, "Karantina durumu okunamıyor, yeni pozisyon açılmıyor"
+        if not self.reconcile_state_ok:
+            return False, "Karantina/uzlaştırma durumu okunamıyor, yeni pozisyon açılmıyor"
         try:
             if not self._set_leverage(symbol, leverage):
                 return False, f"Kaldıraç ayarlanamadı ({leverage}x), pozisyon açılmadı"
@@ -1368,11 +1373,20 @@ class FuturesTrader(ExitEngineMixin):
             total_comm = (comm + pos.get("realized_commission", 0.0)
                           + pos.get("open_commission", 0.0))
             risk = pos.get("risk_amount", 0.0)
+            since_ms = int(pos["open_time"].timestamp() * 1000)
+            ex_net, verified = self._exchange_net_pnl(symbol, since_ms)
+            if verified and ex_net is not None:
+                net = ex_net
+            else:
+                self.pnl_unverified[symbol] = "acil kapanış PnL'i borsadan doğrulanamadı"
+                logger.error(f"{symbol}: acil kapanış PnL'i doğrulanamadı — "
+                             f"yerel tahmin kaydedildi ({net:+.2f}$)")
             self.total_pnl += net
             if net >= 0: self.wins += 1
             else:        self.losses += 1
             self._record_trade(pos, px, "EMERGENCY_CLOSE",
-                               net + total_comm, total_comm, net)
+                               net + total_comm, total_comm, net,
+                               pnl_verified=bool(verified and ex_net is not None))
             self.exchange_closed.append((
                 symbol, "EMERGENCY_CLOSE", net,
                 round(net / risk, 3) if risk > 0 else 0.0,
@@ -1384,6 +1398,46 @@ class FuturesTrader(ExitEngineMixin):
             logger.info(f"{symbol} korumasız kalınca kapatıldı ve doğrulandı | {net:+.2f}$")
         else:
             logger.error(f"{symbol} kapama emri gönderildi ama pozisyon hâlâ açık")
+
+    def _exchange_net_pnl(self, symbol: str, since_ms: int):
+        """Borsadan NET gerçekleşen PnL: realized + komisyon + funding.
+
+        Dönüş: (net, doğrulandı_mı). Bileşenlerden biri okunamazsa sonuç
+        DOĞRULANMIŞ SAYILMAZ — eksik bir net, iyimser bir nettir.
+
+        DENETİM BULGUSU: bu sorgu yalnız borsa-stop senkronizasyonunda
+        yapılıyordu. Normal ve acil kapanışlar net PnL'i YEREL tahminle
+        (sabit COMMISSION_RATE, funding yok) hesaplayıp `pnl_verified=True`
+        yazıyordu; yani doğrulanmamış sayılar go-live örneklemine gerçek
+        ölçüm gibi giriyordu.
+        """
+        total, verified = None, True
+        try:
+            rows = self.client.futures_income_history(
+                symbol=symbol, incomeType="REALIZED_PNL",
+                startTime=since_ms, limit=50,
+            )
+            if rows:
+                total = sum(float(i["income"]) for i in rows)
+        except Exception as e:
+            logger.error(f"{symbol}: gerçekleşen PnL okunamadı: {e}")
+            return None, False
+        if total is None:
+            # Kayıt yok: borsa henüz yazmamış olabilir. "0 kâr" DEĞİL,
+            # "ölçemedim" demektir.
+            return None, False
+        for kind in ("COMMISSION", "FUNDING_FEE"):
+            try:
+                rows = self.client.futures_income_history(
+                    symbol=symbol, incomeType=kind,
+                    startTime=since_ms, limit=50,
+                )
+                if rows:
+                    total += sum(float(i["income"]) for i in rows)
+            except Exception as e:
+                verified = False
+                logger.error(f"{symbol}: {kind} okunamadı: {e}")
+        return total, verified
 
     def _position_amount(self, symbol: str) -> float:
         try:
@@ -1480,6 +1534,21 @@ class FuturesTrader(ExitEngineMixin):
             total_comm = comm + pos.get("realized_commission", 0.0) + pos.get("open_commission", 0.0)
             total_gross= total_net + total_comm
 
+            # Borsadan doğrula. Doğrulanırsa borsanın NET'i esas alınır
+            # (gerçek komisyon + funding içerir); doğrulanamazsa yerel tahmin
+            # kalır ama işlem DOĞRULANMAMIŞ olarak kaydedilir.
+            since_ms = int(pos["open_time"].timestamp() * 1000)
+            ex_net, verified = self._exchange_net_pnl(symbol, since_ms)
+            if verified and ex_net is not None:
+                self.total_pnl += ex_net - total_net
+                self.balance   += ex_net - total_net
+                total_net  = ex_net
+                total_gross = total_net + total_comm
+            else:
+                self.pnl_unverified[symbol] = "kapanış PnL'i borsadan doğrulanamadı"
+                logger.error(f"{symbol}: kapanış PnL'i doğrulanamadı — "
+                             f"yerel tahmin kaydedildi ({total_net:+.2f}$)")
+
             if total_net >= 0: self.wins += 1
             else:              self.losses += 1
 
@@ -1487,7 +1556,8 @@ class FuturesTrader(ExitEngineMixin):
                 time=datetime.now(), symbol=symbol,
                 action=f"CLOSE ({reason})", price=price, pnl=net,
             ))
-            self._record_trade(pos, price, reason, total_gross, total_comm, total_net)
+            self._record_trade(pos, price, reason, total_gross, total_comm, total_net,
+                               pnl_verified=bool(verified and ex_net is not None))
             self._persist_positions()
             return True, total_net
         except BinanceAPIException as e:
