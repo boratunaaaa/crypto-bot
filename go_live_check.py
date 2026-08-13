@@ -37,21 +37,57 @@ GATES = {
     # en uzun sessiz boşluk ayrıca ölçülür.
     "min_active_days":       20,
     "max_silent_gap_days":   2.0,
+    # Gerçek çalışma kanıtı: equity snapshot akışındaki en uzun kesinti.
+    "max_heartbeat_gap_hours": 2.0,
 }
 
 
 def _starting_equity() -> float:
-    """Refactor kesim anındaki sermaye. Yoksa yapılandırılmış başlangıç."""
+    """
+    KESİM ANINDAKİ sermaye.
+
+    DENETİM BULGUSU: burada `bot_state.paper_balance` okunuyordu — o GÜNCEL
+    bakiye, kesim anındaki değil. Bugün 1200$ olan bir hesap için, 1000$'dan
+    başlayıp 1200$'a çıkmış bir eğrinin drawdown'ı yanlış tabana bölünüyordu.
+    Doğrusu, kesimden sonraki İLK equity snapshot'ı.
+    """
     from config import PAPER_BALANCE
     try:
-        rows = _rows("SELECT value FROM bot_state WHERE key = 'paper_balance'")
+        rows = _rows(
+            "SELECT equity FROM equity_snapshots WHERE at >= ? ORDER BY at LIMIT 1",
+            (REFACTOR_CUTOFF,),
+        )
         if rows:
-            import json
-            v = rows[0]["value"]
-            return float(json.loads(v) if isinstance(v, str) else v)
+            return float(rows[0]["equity"])
     except Exception:
         pass
     return float(PAPER_BALANCE)
+
+
+def _heartbeat_uptime() -> tuple[float, float]:
+    """
+    Gerçek çalışma süresi — equity snapshot akışından.
+
+    Snapshot dakikada bir yazılır ve süreç ölünce durur. İşlem aralıklarının
+    aksine, "bot ayaktaydı ama sinyal bulamadı" ile "bot kapalıydı" ayrımını
+    yapabilen tek kayıt budur.
+
+    Dönüş: (kapsanan gün, en uzun kesinti saati)
+    """
+    from datetime import datetime as _dt
+    try:
+        rows = _rows(
+            "SELECT at FROM equity_snapshots WHERE at >= ? ORDER BY at",
+            (REFACTOR_CUTOFF,),
+        )
+    except Exception:
+        return 0.0, float("inf")
+    if len(rows) < 2:
+        return 0.0, float("inf")
+    ts = [_dt.fromisoformat(r["at"]) for r in rows]
+    span = (ts[-1] - ts[0]).total_seconds() / 86400
+    gap = max((b - a).total_seconds() / 3600 for a, b in zip(ts, ts[1:]))
+    return span, gap
 
 
 def _snapshot_drawdown() -> float | None:
@@ -164,9 +200,15 @@ def check() -> tuple[bool, list[tuple[str, bool, str]]]:
     if snap_dd is not None:
         max_dd = max(max_dd, snap_dd)
         source = "equity snapshot (açık pozisyonlar dahil)"
+        ok = max_dd <= GATES["max_drawdown_pct"]
     else:
-        source = "kapanmış işlemler — ALT SINIR, gerçek DD daha yüksek olabilir"
-    ok = max_dd <= GATES["max_drawdown_pct"]
+        # DENETİM BULGUSU: snapshot yoksa kapı kapanmış işlemlerle GEÇEBİLİYORDU.
+        # Kapanmış işlem eğrisi açık pozisyonun anlık zararını görmez; -3R'ye
+        # inip +1R'de kapanan işlem kayıtta sıfır drawdown'lı bir kazançtır.
+        # Ölçemediğimiz bir şeyi "geçti" saymak, kapıyı anlamsız kılar.
+        source = ("YETERSİZ equity snapshot — gerçek drawdown ÖLÇÜLEMEDİ, "
+                  "kapı geçilemez")
+        ok = False
     results.append((
         "Max drawdown",
         ok,
@@ -185,15 +227,21 @@ def check() -> tuple[bool, list[tuple[str, bool, str]]]:
     gaps = [(b - a).total_seconds() / 86400 for a, b in zip(times, times[1:])]
     max_gap = max(gaps) if gaps else 0.0
 
+    # DENETİM: işlem aralıkları "çalışıyordu"nun kanıtı DEĞİL — bot ayakta olup
+    # hiç sinyal bulmamış da olabilir, ya da tamamen kapalı da. Gerçek kanıt
+    # equity snapshot'larıdır: dakikada bir yazılır, süreç ölünce durur.
+    hb_days, hb_gap = _heartbeat_uptime()
     ok = (span_days >= GATES["min_uptime_days"]
           and active_days >= GATES["min_active_days"]
-          and max_gap <= GATES["max_silent_gap_days"])
+          and max_gap <= GATES["max_silent_gap_days"]
+          and hb_days >= GATES["min_uptime_days"]
+          and hb_gap <= GATES["max_heartbeat_gap_hours"])
     results.append((
         "Kesintisiz çalışma",
         ok,
-        f"{span_days:.1f} gün aralık, {active_days} aktif gün "
-        f"(gereken {GATES['min_active_days']}), en uzun sessizlik {max_gap:.1f} gün "
-        f"(izin ≤{GATES['max_silent_gap_days']})",
+        f"{span_days:.1f} gün aralık, {active_days} aktif gün, "
+        f"heartbeat {hb_days:.1f} gün / en uzun kesinti {hb_gap:.1f} saat "
+        f"(izin ≤{GATES['max_heartbeat_gap_hours']}s)",
     ))
 
     # 7) Çıkış etiketleri gerçekten ayrışıyor mu?

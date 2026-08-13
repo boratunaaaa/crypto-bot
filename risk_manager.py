@@ -375,7 +375,13 @@ def portfolio_open_risk_r(positions: dict) -> float:
             risk_per_unit_now = max(0.0, entry - stop)
         else:
             risk_per_unit_now = max(0.0, stop - entry)
-        total += (risk_per_unit_now * qty) / risk_amount
+        # DENETİM BULGUSU: burada her pozisyon KENDİ dolar riskine bölünüyordu,
+        # yani hepsi en fazla 1.0R sayılıyordu. İki adet 1.6R pozisyonun
+        # gerçek toplamı 3.2R iken bot 2.0R raporluyor ve 4R tavanının altında
+        # sanıyordu. Risk birimi tek olmalı: `allocated_r`, pozisyonun açılış
+        # anındaki gerçek ağırlığıdır.
+        weight = float(pos.get("allocated_r", 1.0) or 1.0)
+        total += (risk_per_unit_now * qty) / risk_amount * weight
     return round(total, 3)
 
 

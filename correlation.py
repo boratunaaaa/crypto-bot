@@ -95,13 +95,17 @@ def net_directional_r(positions: dict, betas: dict[str, float] | None = None) ->
         entry = pos["entry_price"]
         stop  = pos.get("stop_loss", entry)
         qty   = pos.get("qty", 0.0)
+        # `allocated_r` ile ağırlıklandır — risk_manager ile AYNI birim.
+        # Aksi hâlde her pozisyon 1R sayılır ve büyük riskli pozisyonlar
+        # portföy maruziyetinde görünmez olur.
+        weight = float(pos.get("allocated_r", 1.0) or 1.0)
         if pos["side"] == "BUY":
             open_r = max(0.0, entry - stop) * qty / risk_amount
             sign = 1.0
         else:
             open_r = max(0.0, stop - entry) * qty / risk_amount
             sign = -1.0
-        total += sign * open_r * betas.get(sym, 1.0)
+        total += sign * open_r * weight * betas.get(sym, 1.0)
     return round(total, 3)
 
 
@@ -125,8 +129,9 @@ def stress_loss_r(positions: dict, shock_pct: float,
         entry = pos["entry_price"]
         stop  = pos.get("stop_loss", entry)
         qty   = pos.get("qty", 0.0)
+        weight = float(pos.get("allocated_r", 1.0) or 1.0)
         remaining_r = (max(0.0, entry - stop) if pos["side"] == "BUY"
-                       else max(0.0, stop - entry)) * qty / risk_amount
+                       else max(0.0, stop - entry)) * qty / risk_amount * weight
         if remaining_r <= 0:
             continue                              # breakeven'e taşınmış, risksiz
 
@@ -167,7 +172,7 @@ def can_add_correlated(positions: dict, symbol: str, side: str,
     probe[f"__probe__{symbol}"] = {
         "symbol": symbol, "side": side, "entry_price": 100.0,
         "stop_loss": 98.0 if side == "BUY" else 102.0,
-        "qty": 1.0, "risk_amount": 2.0 / r,
+        "qty": 1.0, "risk_amount": 2.0, "allocated_r": r,
     }
     b = dict(betas)
     b[f"__probe__{symbol}"] = betas.get(symbol, 1.0)

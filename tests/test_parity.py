@@ -41,9 +41,11 @@ def _make_futures_trader():
                 ],
             }]
         }
-        cl.futures_create_order.return_value = {
-            "orderId": 1, "avgPrice": "100.0",
-            "executedQty": "999999", "status": "FILLED",
+        # Emir yanıtı istenen miktarı tamamen doldurmuş gibi döner —
+        # kısmi çıkış artık executedQty okuduğu için bu şart.
+        cl.futures_create_order.side_effect = lambda **kw: {
+            "orderId": 1, "avgPrice": "100.0", "status": "FILLED",
+            "executedQty": str(kw.get("quantity", 999999)),
         }
         cl.futures_change_leverage.return_value = {}
         cl.futures_change_margin_type.return_value = {}

@@ -298,6 +298,11 @@ def load_open_positions() -> dict:
 
 # ── İşlem kaydı ───────────────────────────────────────────────────────────────
 
+def _mode() -> str:
+    from config import PAPER_TRADING
+    return "paper" if PAPER_TRADING else "live"
+
+
 def save_trade(
     symbol:       str,
     side:         str,
@@ -338,8 +343,8 @@ def save_trade(
                  open_time, close_time, duration_min, score, btc_trend,
                  market_regime, atr_pct, fear_greed,
                  strategy, r_multiple, mae_r, mfe_r, risk_amount, initial_stop,
-                 partial_pnl, exit_detail, entry_snapshot, funding_cost)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 partial_pnl, exit_detail, entry_snapshot, funding_cost, mode)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 symbol, side, entry_price, close_price, margin, leverage,
                 gross_pnl, commission, net_pnl, reason_open, reason_close,
@@ -348,6 +353,10 @@ def save_trade(
                 strategy, r_multiple, mae_r, mfe_r, risk_amount, initial_stop,
                 partial_pnl, exit_detail,
                 json.dumps(entry_snapshot or {}, default=str), funding_cost,
+                # DENETİM: `mode` sütunu eklenmişti ama HİÇ yazılmıyordu;
+                # tüm satırlar varsayılan 'paper' kalıyordu. Go-live kapısı
+                # kâğıt ve canlı işlemleri ayırt edemezdi.
+                _mode(),
             ))
         _update_daily_stats(close_time.date(), net_pnl, commission, gross_pnl)
     except Exception as e:

@@ -501,11 +501,13 @@ def test_stop_timeout_checks_exchange_before_emergency_close():
         calls.append(kw.get("type"))
         if kw.get("type") == "STOP_MARKET":
             raise TimeoutError("koptu")
-        return {"orderId": 9, "executedQty": "1.0", "avgPrice": "100.0"}
+        return {"orderId": 9, "executedQty": str(kw.get("quantity", 1.0)), "avgPrice": "100.0"}
 
     t.client.futures_create_order.side_effect = create
+    # Kurulu stop: doğru tip, yön, closePosition VE beklenen fiyat.
     t.client.futures_get_open_orders.return_value = [
-        {"orderId": 77, "type": "STOP_MARKET", "side": "SELL"}   # aslında kurulmuş
+        {"orderId": 77, "type": "STOP_MARKET", "side": "SELL",
+         "closePosition": True, "stopPrice": "98.00"},
     ]
 
     ok, _ = t.open_position("TESTUSDT", "BUY", 100.0, 50.0, 3, 98.0, 107.0,
@@ -546,3 +548,130 @@ def test_exchange_closed_trades_are_queued_for_kill_switch():
     assert t.exchange_closed, "borsa kapanışı kill switch kuyruğuna girmedi"
     sym, reason, pnl, r_mult, alloc = t.exchange_closed[0]
     assert sym == "TESTUSDT" and pnl < 0
+
+
+# ── Üçüncü denetim turu (2026-08-13, Codex) ──────────────────────────────────
+
+def test_partial_exit_uses_actual_filled_quantity():
+    """
+    DENETİM: `_do_partial` emri gönderip `True` dönüyordu, `executedQty` hiç
+    okunmuyordu. Borsada 0.1 dolarken bot yerelde 0.4 düşüyordu — pozisyonun
+    gerçek büyüklüğü ile kayıt sessizce ayrışıyordu ve sonraki stop/kapama
+    emirleri yanlış boyutta gidiyordu.
+    """
+    t = _trader()
+    pos = _pos()
+    pos["qty"] = 1.0
+    pos["initial_qty"] = 1.0
+    t.positions["TESTUSDT"] = pos
+    t.client.futures_create_order.return_value = {
+        "orderId": 4, "executedQty": "0.1", "avgPrice": "102.0",
+    }
+
+    t._apply_partial(pos, 0.4, 102.0, "TP1_PARTIAL")
+
+    assert pos["qty"] == pytest.approx(0.9), \
+        f"borsada 0.1 doldu ama yerelde {1.0 - pos['qty']} düşüldü"
+
+
+def test_failed_partial_does_not_advance_state():
+    """Kısmi çıkış gerçekleşmediyse tp1_done işaretlenmemeli, stop taşınmamalı."""
+    t = _trader()
+    pos = _pos()
+    pos.update(qty=1.0, initial_qty=1.0)
+    t.client.futures_create_order.return_value = {"orderId": 4, "executedQty": "0"}
+    t.client.futures_get_order.return_value = {"orderId": 4, "executedQty": "0"}
+
+    t._apply_partial(pos, 0.4, 102.0, "TP1_PARTIAL")
+
+    assert pos["qty"] == 1.0
+    assert pos["tp1_done"] is False
+    assert pos["stop_loss"] == 95.0, "emir dolmadan stop başabaşa taşındı"
+
+
+def test_hedge_position_is_removed_from_management():
+    """
+    Alarm üretmek yönetimden çıkarmak DEĞİLDİR. Hedge pozisyonu `positions`
+    içinde kalırsa çıkış motoru ona positionSide taşımayan uyumsuz emirler
+    göndermeye devam eder.
+    """
+    t = _trader()
+    t.client.futures_position_information.return_value = [
+        {"symbol": "TESTUSDT", "positionAmt": "1.0", "positionSide": "LONG"}
+    ]
+    t.client.futures_get_order.return_value = {"status": "NEW"}
+    t.restore_positions({"TESTUSDT": _pos()})
+
+    assert "hedge" in t.unprotected.get("TESTUSDT", "").lower()
+    assert "TESTUSDT" not in t.positions, "hedge pozisyonu hâlâ yönetiliyor"
+
+
+def test_stop_recovery_rejects_unrelated_stop_order():
+    """
+    Aynı yöndeki ESKİ veya ELLE konmuş bir stop, yeni koruma sanılmamalı.
+    Fiyat ve closePosition niteliği de doğrulanır.
+    """
+    t = _trader()
+    t.client.futures_get_open_orders.return_value = [
+        {"orderId": 55, "type": "STOP_MARKET", "side": "SELL",
+         "closePosition": True, "stopPrice": "80.00"},      # alakasız fiyat
+    ]
+    assert t._find_live_stop("TESTUSDT", "SELL", want_price=98.0) is None
+    assert t._find_live_stop("TESTUSDT", "SELL", want_price=80.0) == 55
+
+
+def test_stop_recovery_rejects_non_close_position_order():
+    t = _trader()
+    t.client.futures_get_open_orders.return_value = [
+        {"orderId": 56, "type": "STOP_MARKET", "side": "SELL",
+         "closePosition": False, "stopPrice": "98.00"},
+    ]
+    assert t._find_live_stop("TESTUSDT", "SELL", want_price=98.0) is None
+
+
+def test_dust_position_is_not_recorded_as_closed():
+    """
+    Kalan miktar minQty altındaysa emir gönderilemez. Eski kod bu dalda stop'u
+    iptal edip işlemi "kapandı" kaydediyordu — pozisyon borsada AÇIK, koruması
+    alınmış ve takipten düşürülmüş hâlde kalıyordu.
+    """
+    t = _trader()
+    pos = _pos()
+    pos["qty"] = 0.0001                       # minQty 0.001
+    t.positions["TESTUSDT"] = pos
+
+    ok, msg = t.close_position("TESTUSDT", 99.0, reason="MANUAL")
+
+    assert ok is False
+    assert "TESTUSDT" in t.positions
+    assert "TESTUSDT" in t.unprotected
+    t.client.futures_cancel_order.assert_not_called()
+
+
+def test_sync_detects_runtime_direction_flip():
+    """Çalışma sırasında yön değişimi de yakalanmalı, yalnız restart'ta değil."""
+    t = _trader()
+    t.positions["TESTUSDT"] = _pos()
+    t.client.futures_position_information.return_value = [
+        {"symbol": "TESTUSDT", "positionAmt": "-1.0"}      # kayıt BUY
+    ]
+    t.client.futures_account_balance.return_value = [{"asset": "USDT", "balance": "1000"}]
+
+    t.sync_positions()
+
+    assert "TESTUSDT" not in t.positions
+    assert "yön" in t.unprotected.get("TESTUSDT", "").lower()
+
+
+def test_sync_failure_is_fail_closed():
+    """
+    Borsa okunamıyorsa sessizce boş küme dönmek, main döngüsüne "her şey
+    yolunda" demekle aynıdır. Pozisyonlar şüpheli işaretlenmeli.
+    """
+    t = _trader()
+    t.positions["TESTUSDT"] = _pos()
+    t.client.futures_position_information.side_effect = TimeoutError("koptu")
+
+    t.sync_positions()
+
+    assert "TESTUSDT" in t.unprotected
