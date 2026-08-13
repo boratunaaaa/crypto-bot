@@ -30,9 +30,19 @@ from position import (
     new_position, evaluate, position_summary, realized_r, confirm_partial,
     EXIT_MANUAL, EXIT_TP1, EXIT_TP2,
 )
-from database import save_trade, save_open_positions
+from database import save_trade, save_open_positions, state_get, state_set_many
 
 logger = logging.getLogger("trader")
+
+
+def _load_pending_unknown() -> dict:
+    """Restart'ta karantinayı geri yükle — emir timeout'undan sonraki çökme
+    tam da karantinanın en gerekli olduğu andır."""
+    try:
+        v = state_get("pending_unknown_orders")
+        return dict(v) if isinstance(v, dict) else {}
+    except Exception:
+        return {}
 
 
 # ── Yardımcılar ───────────────────────────────────────────────────────────────
@@ -602,7 +612,11 @@ class FuturesTrader(ExitEngineMixin):
         self.exchange_closed: list = []
         # Akıbeti bilinmeyen emirler: symbol -> clientOrderId. Bu sembolde
         # yeni emir GÖNDERİLMEZ; her turda akıbeti yeniden sorulur.
-        self.pending_unknown: dict[str, str] = {}
+        #
+        # DENETİM BULGUSU: yalnız bellekte tutuluyordu. Bot emir timeout'undan
+        # HEMEN SONRA çökerse (ki en olası an tam da odur), restart'ta karantina
+        # tamamen kayboluyor ve aynı emir yeniden gönderilebiliyordu.
+        self.pending_unknown: dict[str, str] = _load_pending_unknown()
         self._load_step_cache()
 
     def _load_step_cache(self):
@@ -649,12 +663,22 @@ class FuturesTrader(ExitEngineMixin):
         küçük görünen bir drawdown üretir — ikisi de yanlış yönde.
         Doğrusu: margin balance (= wallet + gerçekleşmemiş PnL).
         """
+        # DENETİM BULGUSU: `crossUnPnl` yalnız CROSS pozisyonları kapsar. Bu
+        # proje MARGIN_MODE="ISOLATED" kullanıyor, yani izole pozisyonların
+        # gerçekleşmemiş ZARARI equity'de hiç görünmüyordu — drawdown olduğundan
+        # küçük, pozisyon boyutu olduğundan büyük çıkardı.
+        # `totalMarginBalance` = cüzdan + TÜM gerçekleşmemiş PnL.
+        try:
+            acc = self.client.futures_account()
+            tmb = acc.get("totalMarginBalance")
+            if tmb is not None:
+                return float(tmb)
+        except Exception as e:
+            logger.warning(f"Futures hesabı okunamadı: {e}")
         try:
             for b in self.client.futures_account_balance():
                 if b.get("asset") == "USDT":
-                    wallet = float(b.get("balance", 0.0))
-                    upnl = float(b.get("crossUnPnl", 0.0) or 0.0)
-                    return wallet + upnl
+                    return float(b.get("balance", 0.0)) + float(b.get("crossUnPnl", 0.0) or 0.0)
         except Exception as e:
             logger.warning(f"Equity okunamadı, yerel bakiyeye düşüldü: {e}")
         return self.balance
@@ -691,14 +715,24 @@ class FuturesTrader(ExitEngineMixin):
             o = self._recover_order(symbol, stale)
             if o is self.ORDER_ABSENT:
                 self.pending_unknown.pop(symbol, None)      # kesin olmamış
+                self._save_pending()
             elif o is None:
                 logger.error(f"{symbol}: önceki emrin akıbeti hâlâ bilinmiyor — emir yok")
                 return OrderResult(0.0, 0.0, None, "UNKNOWN")
             else:
-                self.pending_unknown.pop(symbol, None)
+                # DENETİM BULGUSU: sözlük dönmesi yeterli sayılıyordu ve emir
+                # hâlâ NEW / 0 dolum olsa bile karantina kaldırılıyordu — yani
+                # borsada açık duran bir emrin üstüne ikincisi gönderilebiliyordu.
+                # Karantina yalnız emir TERMİNAL bir duruma ulaşınca kalkar.
+                st = o.get("status")
                 f, a = self._fill_of(o)
+                if st in ("NEW", "PARTIALLY_FILLED"):
+                    logger.error(f"{symbol}: bekleyen emir hâlâ {st} — yeni emir yok")
+                    return OrderResult(f, a, o.get("orderId"), "UNKNOWN")
+                self.pending_unknown.pop(symbol, None)
+                self._save_pending()
                 if f > 0:
-                    logger.warning(f"{symbol}: bekleyen emir aslında {f} dolmuş")
+                    logger.warning(f"{symbol}: bekleyen emir aslında {f} dolmuş ({st})")
                     return OrderResult(f, a, o.get("orderId"), "FILLED")
 
         step, min_q = self._get_step(symbol)
@@ -726,6 +760,7 @@ class FuturesTrader(ExitEngineMixin):
                 logger.error(f"Emir akıbeti bilinmiyor {symbol} {purpose}: "
                              f"{type(e).__name__}: {e}")
                 self.pending_unknown[symbol] = coid
+                self._save_pending()
                 return OrderResult(0.0, 0.0, None, "UNKNOWN")
 
         filled, avg = self._fill_of(o)
@@ -734,12 +769,34 @@ class FuturesTrader(ExitEngineMixin):
             if isinstance(probe, dict):
                 o = probe
                 filled, avg = self._fill_of(o)
+                # Emir hâlâ AÇIK (NEW/PARTIALLY_FILLED) — "olmadı" değil,
+                # "henüz olmadı". Sonraki tur ikinci emir göndermemeli.
+                if filled <= 0 and probe.get("status") in ("NEW", "PARTIALLY_FILLED"):
+                    self.pending_unknown[symbol] = coid
+                    self._save_pending()
+                    return OrderResult(0.0, 0.0, probe.get("orderId"), "UNKNOWN")
+            elif probe is None:
+                # DENETİM BULGUSU: emir NEW/0 dönüp takip sorgusu da
+                # başarısız olursa sonuç NONE oluyordu ve sembol karantinaya
+                # ALINMIYORDU. Emir borsada açıkken sonraki tur ikinci emir
+                # gönderebilirdi.
+                logger.error(f"{symbol} {purpose}: dolum doğrulanamadı — karantina")
+                self.pending_unknown[symbol] = coid
+                self._save_pending()
+                self._save_pending()
+                return OrderResult(0.0, 0.0, None, "UNKNOWN")
 
         status = ("FILLED" if filled >= q * 0.999
                   else "PARTIAL" if filled > 0 else "NONE")
         if status == "PARTIAL":
             logger.warning(f"{symbol} {purpose}: kısmi dolum {filled}/{q}")
         return OrderResult(filled, avg, o.get("orderId") if o else None, status)
+
+    def _save_pending(self) -> None:
+        try:
+            state_set_many({"pending_unknown_orders": self.pending_unknown})
+        except Exception as e:
+            logger.debug(f"Karantina kaydedilemedi: {e}")
 
     def _client_order_id(self, symbol: str) -> str:
         """
@@ -785,11 +842,22 @@ class FuturesTrader(ExitEngineMixin):
         except (TypeError, ValueError):
             return 0.0, 0.0
 
+    # Binance: "No need to change margin type" — zaten istenen moddayız.
+    MARGIN_ALREADY_SET = -4046
+
     def _set_leverage(self, symbol: str, leverage: int) -> bool:
         try:
             self.client.futures_change_margin_type(symbol=symbol, marginType=MARGIN_MODE)
-        except BinanceAPIException:
-            pass
+        except Exception as e:
+            # DENETİM BULGUSU: burada TÜM hatalar yok sayılıyordu (fail-open).
+            # Marjin modu ISOLATED'a alınamadığında pozisyon CROSS açılır ve
+            # tek bir işlem tüm hesabı likidasyona sürükleyebilir. Yalnız
+            # "zaten bu modda" güvenle yok sayılabilir.
+            if getattr(e, "code", None) != self.MARGIN_ALREADY_SET:
+                logger.error(
+                    f"Marjin modu {MARGIN_MODE} yapılamadı {symbol}: {e} — pozisyon açılmıyor"
+                )
+                return False
         try:
             self.client.futures_change_leverage(symbol=symbol, leverage=leverage)
             return True
@@ -1378,6 +1446,19 @@ class FuturesTrader(ExitEngineMixin):
                         )
                         if income:
                             pnl = sum(float(i["income"]) for i in income)
+                        # DENETİM: yalnız REALIZED_PNL okunuyordu; komisyon ve
+                        # funding net sonuçtan düşülmüyordu. Kill switch gerçek
+                        # NET zarar yerine daha iyimser BRÜT PnL görüyordu.
+                        for kind in ("COMMISSION", "FUNDING_FEE"):
+                            try:
+                                extra = self.client.futures_income_history(
+                                    symbol=sym, incomeType=kind,
+                                    startTime=since, limit=50,
+                                )
+                                if extra and pnl is not None:
+                                    pnl += sum(float(i["income"]) for i in extra)
+                            except Exception as ie:
+                                logger.warning(f"SYNC: {sym} {kind} okunamadı: {ie}")
                     except Exception as e:
                         logger.error(f"SYNC: {sym} PnL geçmişi okunamadı: {e}")
                     try:

@@ -861,12 +861,26 @@ def test_futures_equity_does_not_double_count_margin():
     daha büyük pozisyon ve olduğundan küçük drawdown üretir.
     """
     t = _trader()
-    t.client.futures_account_balance.return_value = [
-        {"asset": "USDT", "balance": "1000.0", "crossUnPnl": "0.0"}
-    ]
+    t.client.futures_account.return_value = {"totalMarginBalance": "1000.0"}
     t.positions["TESTUSDT"] = _pos()          # margin 33
     assert t.equity == pytest.approx(1000.0), \
         f"teminat ikinci kez sayıldı: {t.equity}"
+
+
+def test_isolated_unrealized_loss_is_included_in_equity():
+    """
+    DENETİM: `crossUnPnl` yalnız CROSS pozisyonları kapsar. Proje ISOLATED
+    kullanıyor; izole pozisyonların gerçekleşmemiş ZARARI equity'de hiç
+    görünmüyordu — drawdown olduğundan küçük, pozisyon boyutu olduğundan
+    büyük çıkardı. `totalMarginBalance` tüm gerçekleşmemiş PnL'i içerir.
+    """
+    t = _trader()
+    t.client.futures_account.return_value = {"totalMarginBalance": "940.0"}
+    t.client.futures_account_balance.return_value = [
+        {"asset": "USDT", "balance": "1000.0", "crossUnPnl": "0.0"}   # izole zarar görünmez
+    ]
+    assert t.equity == pytest.approx(940.0), \
+        "izole pozisyonun gerçekleşmemiş zararı equity'ye yansımadı"
 
 
 def test_unknown_order_quarantines_symbol():
@@ -933,3 +947,120 @@ def test_restart_with_unverifiable_stop_does_not_duplicate():
              if c.kwargs.get("type") == "STOP_MARKET"]
     assert not stops, "durumu bilinmeyen stopun üstüne ikincisi kuruldu"
     assert "TESTUSDT" in t.unprotected
+
+
+# ── Altıncı tur (2026-08-13, Codex) ──────────────────────────────────────────
+
+def test_zero_fill_with_failed_requery_quarantines():
+    """
+    DENETİM: emir NEW/0 dönüp takip sorgusu da başarısız olursa sonuç NONE
+    oluyor ve sembol karantinaya ALINMIYORDU. Emir borsada açıkken sonraki
+    tur ikinci emir gönderebilirdi.
+    """
+    t = _trader()
+    t.client.futures_create_order.return_value = {"orderId": 5, "executedQty": "0"}
+    t.client.futures_get_order.side_effect = TimeoutError("koptu")
+
+    res = t._execute("TESTUSDT", "BUY", 1.0, purpose="giriş")
+
+    assert res.status == "UNKNOWN", f"beklenen UNKNOWN, gelen {res.status}"
+    assert t.pending_unknown.get("TESTUSDT"), "karantinaya alınmadı"
+
+
+def test_still_open_order_keeps_quarantine():
+    """
+    Karantinadaki emir hâlâ NEW ise karantina KALKMAMALI. Sözlük dönmesi
+    "emir bitti" demek değildir; borsada açık duran emrin üstüne ikincisi
+    gönderilirse çift pozisyon oluşur.
+    """
+    t = _trader()
+    t.pending_unknown["TESTUSDT"] = "cb-eski"
+    t.client.futures_get_order.return_value = {
+        "orderId": 5, "status": "NEW", "executedQty": "0",
+    }
+    before = t.client.futures_create_order.call_count
+
+    res = t._execute("TESTUSDT", "BUY", 1.0, purpose="giriş")
+
+    assert res.status == "UNKNOWN"
+    assert t.client.futures_create_order.call_count == before, \
+        "hâlâ NEW olan emrin üstüne yenisi gönderildi"
+    assert "TESTUSDT" in t.pending_unknown
+
+
+def test_terminal_order_lifts_quarantine():
+    """Emir terminal duruma ulaşınca karantina kalkmalı."""
+    t = _trader()
+    t.pending_unknown["TESTUSDT"] = "cb-eski"
+    t.client.futures_get_order.return_value = {
+        "orderId": 5, "status": "CANCELED", "executedQty": "0",
+    }
+    t._execute("TESTUSDT", "BUY", 1.0, purpose="giriş")
+    assert "TESTUSDT" not in t.pending_unknown
+
+
+def test_quarantine_survives_restart():
+    """
+    Bot emir timeout'undan HEMEN SONRA çökerse — ki en olası an odur —
+    restart'ta karantina kaybolmamalı.
+    """
+    t = _trader()
+    t.client.futures_create_order.side_effect = TimeoutError("koptu")
+    t.client.futures_get_order.side_effect = TimeoutError("koptu")
+    t._execute("TESTUSDT", "BUY", 1.0, purpose="giriş")
+    assert t.pending_unknown
+
+    import trader as tr
+    assert tr._load_pending_unknown().get("TESTUSDT"), "karantina diske yazılmadı"
+
+
+def test_margin_mode_failure_blocks_entry():
+    """
+    DENETİM: `futures_change_margin_type` tüm hatalarda yok sayılıyordu
+    (fail-open). Marjin modu ISOLATED'a alınamazsa pozisyon CROSS açılır ve
+    tek işlem tüm hesabı likidasyona sürükleyebilir.
+    """
+    t = _trader()
+    t.client.futures_change_margin_type.side_effect = _api_error(-1001)
+
+    ok, msg = t.open_position("TESTUSDT", "BUY", 100.0, 50.0, 3, 98.0, 107.0,
+                              qty=1.0, risk_amount=2.0)
+
+    assert ok is False, "marjin modu ayarlanamadığı hâlde pozisyon açıldı"
+    assert "TESTUSDT" not in t.positions
+
+
+def test_already_correct_margin_mode_is_not_an_error():
+    """'Zaten bu modda' hatası güvenle yok sayılabilir — tek istisna budur."""
+    t = _trader()
+    t.client.futures_change_margin_type.side_effect = _api_error(-4046)
+    t.client.futures_position_information.return_value = []
+    ok, _ = t.open_position("TESTUSDT", "BUY", 100.0, 50.0, 3, 98.0, 107.0,
+                            qty=1.0, risk_amount=2.0)
+    assert ok is True
+
+
+def test_exchange_close_pnl_includes_commission_and_funding():
+    """
+    Yalnız REALIZED_PNL okunuyordu; komisyon ve funding düşülmüyordu. Kill
+    switch gerçek NET zarar yerine daha iyimser BRÜT PnL görüyordu.
+    """
+    t = _trader()
+    t.positions["TESTUSDT"] = _pos(stop=95.0)
+    t.client.futures_position_information.return_value = []
+    t.client.futures_symbol_ticker.return_value = {"price": "101.0"}
+    t.client.futures_account_balance.return_value = [{"asset": "USDT", "balance": "1000"}]
+
+    def income(**kw):
+        return {
+            "REALIZED_PNL": [{"income": "10.0"}],
+            "COMMISSION":   [{"income": "-1.5"}],
+            "FUNDING_FEE":  [{"income": "-0.5"}],
+        }.get(kw.get("incomeType"), [])
+
+    t.client.futures_income_history.side_effect = income
+    t.sync_positions()
+
+    assert t.exchange_closed
+    assert t.exchange_closed[0][2] == pytest.approx(8.0), \
+        f"brüt 10 yerine net 8 bekleniyordu, gelen {t.exchange_closed[0][2]}"
