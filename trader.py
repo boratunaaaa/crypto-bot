@@ -15,6 +15,7 @@ anlamına geliyordu.
 
 import logging
 import math
+import time
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -35,14 +36,62 @@ from database import save_trade, save_open_positions, state_get, state_set_many
 logger = logging.getLogger("trader")
 
 
-def _load_pending_unknown() -> dict:
+# ── Karantina kaydı ───────────────────────────────────────────────────────────
+#
+# DENETİM BULGUSU: kayıt yalnız `symbol → clientOrderId` idi. Emrin YÖNÜ,
+# MİKTARI ve reduceOnly bilgisi saklanmadığı için bekleyen bir SELL/reduceOnly
+# kapanış emri, sonraki BUY giriş çağrısına "başarılı giriş" sonucu olarak
+# dönebiliyordu — yani bir operasyonun dolumu başka bir operasyona yazılıyordu.
+# Artık kayıt, emrin hangi operasyona ait olduğunu belirlemeye yetecek bağlamı
+# taşır ve eski sonuç YALNIZ kendi operasyonuyla uzlaştırılır.
+
+def _pending_record(coid: str, side, qty, reduce_only, purpose, ts) -> dict:
+    return {"coid": coid, "side": side, "qty": float(qty or 0.0),
+            "reduce_only": bool(reduce_only), "purpose": purpose or "",
+            "ts": int(ts or 0)}
+
+
+def _normalize_pending(v):
+    """Eski format (düz clientOrderId) da okunabilsin.
+
+    Bağlamı bilinmeyen kayıt hiçbir çağrıyla EŞLEŞMEZ — yani körlemesine
+    sahiplenilmez, yalnız yeni emri bloke eder. Doğru olan budur.
+    """
+    if isinstance(v, str) and v:
+        return _pending_record(v, None, 0.0, None, "eski kayıt (bağlam yok)", 0)
+    if isinstance(v, dict) and v.get("coid"):
+        return _pending_record(v["coid"], v.get("side"), v.get("qty"),
+                               v.get("reduce_only"), v.get("purpose"), v.get("ts"))
+    return None
+
+
+def _load_pending_unknown() -> tuple[dict, bool]:
     """Restart'ta karantinayı geri yükle — emir timeout'undan sonraki çökme
-    tam da karantinanın en gerekli olduğu andır."""
+    tam da karantinanın en gerekli olduğu andır.
+
+    Dönüş: (kayıtlar, okuma_güvenilir_mi). İkinci değer False ise bekleyen bir
+    emir olup olmadığını BİLMİYORUZ; DENETİM BULGUSU olarak bu hata sessizce
+    yutuluyordu ve restart koruması sessizce kaybolabiliyordu.
+    """
     try:
         v = state_get("pending_unknown_orders")
-        return dict(v) if isinstance(v, dict) else {}
-    except Exception:
-        return {}
+    except Exception as e:
+        logger.error(f"KARANTİNA OKUNAMADI — bekleyen emir olabilir: {e}")
+        return {}, False
+    if v is None:
+        return {}, True
+    if not isinstance(v, dict):
+        logger.error(f"Karantina kaydı bozuk ({type(v).__name__}) — güvenli tarafta kalınıyor")
+        return {}, False
+    out, ok = {}, True
+    for sym, raw in v.items():
+        rec = _normalize_pending(raw)
+        if rec is None:
+            logger.error(f"Karantina kaydı çözülemedi {sym}: {raw!r}")
+            ok = False
+            continue
+        out[sym] = rec
+    return out, ok
 
 
 # ── Yardımcılar ───────────────────────────────────────────────────────────────
@@ -135,7 +184,15 @@ class OrderResult:
 
     @property
     def ok(self) -> bool:
-        return self.filled > 0
+        """Emir DOĞRULANMIŞ şekilde gerçekleşti mi?
+
+        `filled > 0` yetmez. UNKNOWN durumunda dolum gerçek olsa bile emir
+        borsada çalışmaya DEVAM ediyor olabilir; o dolumu "olmuş" sayıp yerele
+        işlemek, kayıt ile borsayı ayrıştırır — pozisyon sonradan büyür ve
+        yereldeki miktar yanlış kalır. Doğrulanmamış dolum üzerine karar
+        alınmaz; ayrışmayı sahipsiz pozisyon taraması yakalar.
+        """
+        return self.filled > 0 and self.status in ("FILLED", "PARTIAL")
 
 
 # ── Ortak çıkış yürütücüsü ────────────────────────────────────────────────────
@@ -616,7 +673,17 @@ class FuturesTrader(ExitEngineMixin):
         # DENETİM BULGUSU: yalnız bellekte tutuluyordu. Bot emir timeout'undan
         # HEMEN SONRA çökerse (ki en olası an tam da odur), restart'ta karantina
         # tamamen kayboluyor ve aynı emir yeniden gönderilebiliyordu.
-        self.pending_unknown: dict[str, str] = _load_pending_unknown()
+        self.pending_unknown, self.pending_state_ok = _load_pending_unknown()
+        # Borsada gerçekleşmiş ama yerel kayda işlenmemiş dolumlar. Kayıt ile
+        # borsa ayrıştığı için pozisyon boyutu güvenilmez → İŞLEM DURUR.
+        self.reconcile_needed: dict[str, str] = {}
+        # Kapanış PnL'i doğrulanamayan işlemler. Bunlar işlemi DURDURMAZ:
+        # muhafazakâr değer zaten kill switch'e gidiyor, üstüne bir de kalıcı
+        # duruş koymak geçici bir sorgu hatasını tam kesintiye çevirirdi.
+        self.pnl_unverified: dict[str, str] = {}
+        # Equity ölçülemiyorsa yeni giriş açılmaz (aşağıda `equity`).
+        self.equity_stale = False
+        self._last_equity: float | None = None
         self._load_step_cache()
 
     def _load_step_cache(self):
@@ -671,17 +738,21 @@ class FuturesTrader(ExitEngineMixin):
         try:
             acc = self.client.futures_account()
             tmb = acc.get("totalMarginBalance")
-            if tmb is not None:
-                return float(tmb)
+            if tmb is None:
+                raise ValueError("totalMarginBalance alanı yok")
+            val = float(tmb)
+            self._last_equity = val
+            self.equity_stale = False
+            return val
         except Exception as e:
-            logger.warning(f"Futures hesabı okunamadı: {e}")
-        try:
-            for b in self.client.futures_account_balance():
-                if b.get("asset") == "USDT":
-                    return float(b.get("balance", 0.0)) + float(b.get("crossUnPnl", 0.0) or 0.0)
-        except Exception as e:
-            logger.warning(f"Equity okunamadı, yerel bakiyeye düşüldü: {e}")
-        return self.balance
+            # DENETİM BULGUSU: burada `crossUnPnl` hesabına düşülüyordu. Bu
+            # proje ISOLATED kullanıyor; o alan izole zararı GÖRMEZ, yani
+            # yedek yol tam da düzeltilen yanlış equity'yi geri getiriyordu.
+            # Yanlış bir sayı üretmektense ölçemediğimizi söyleriz: son bilinen
+            # değer döner ama YENİ GİRİŞ AÇILMAZ (bkz. open_position).
+            self.equity_stale = True
+            logger.error(f"Equity ölçülemedi — yeni giriş durduruldu: {e}")
+        return self._last_equity if self._last_equity is not None else self.balance
 
     def transfer_spot_to_futures(self, amount: float) -> bool:
         try:
@@ -707,40 +778,126 @@ class FuturesTrader(ExitEngineMixin):
     #   3. Hata/timeout'ta kurtarma → körlemesine ikinci emir GÖNDERİLMEZ
     #   4. executedQty doğrulaması  → "gönderildi" ≠ "gerçekleşti"
 
+    # Bir emir TERMİNAL duruma ulaşmadıkça borsada çalışmaya devam eder.
+    TERMINAL_STATUS = ("FILLED", "CANCELED", "EXPIRED", "REJECTED")
+
+    def _matches_pending(self, rec: dict, symbol: str, side: str,
+                         q: float, reduce_only: bool) -> bool:
+        """Karantinadaki emir, ŞU ANKİ çağrının emri mi?
+
+        Eşleşme yoksa o emrin dolumu bu çağrının sonucu SAYILAMAZ.
+        """
+        if rec.get("side") != side:
+            return False
+        if bool(rec.get("reduce_only")) != bool(reduce_only):
+            return False
+        want = float(rec.get("qty") or 0.0)
+        if want <= 0:
+            return False                       # bağlamsız eski kayıt
+        step, _ = self._get_step(symbol)
+        return abs(want - q) <= max(step, want * 0.01)
+
+    def _reconcile_pending(self, symbol: str, side: str, q: float,
+                           reduce_only: bool):
+        """Bekleyen emri çöz. Dönüş: (yeni_emre_devam_edilebilir, sonuç)."""
+        raw = self.pending_unknown.get(symbol)
+        if not raw:
+            return True, None
+        rec = _normalize_pending(raw)
+        if rec is None:
+            # Kaydı çözemiyorsak bekleyen emrin ne olduğunu BİLMİYORUZ.
+            # Bilinmeyende yeni emir göndermek, karantinanın varlık sebebine
+            # aykırıdır.
+            logger.error(f"{symbol}: karantina kaydı çözülemedi ({raw!r}) — yeni emir yok")
+            return False, OrderResult(0.0, 0.0, None, "UNKNOWN")
+
+        coid = rec.get("coid")
+        o = self._recover_order(symbol, coid)
+
+        if o is self.ORDER_ABSENT:                 # kesin olmamış
+            self.pending_unknown.pop(symbol, None)
+            self._save_pending()
+            return True, None
+
+        if o is None:                              # hâlâ bilinmiyor
+            logger.error(f"{symbol}: önceki emrin ({rec.get('purpose')}) akıbeti "
+                         f"hâlâ bilinmiyor — yeni emir yok")
+            return False, OrderResult(0.0, 0.0, None, "UNKNOWN")
+
+        st = o.get("status")
+        f, a = self._fill_of(o)
+
+        # Karantina YALNIZ emir terminal duruma ulaşınca kalkar. Aksi hâlde
+        # borsada açık duran bir emrin üstüne ikincisi gönderilirdi.
+        if st not in self.TERMINAL_STATUS:
+            logger.error(f"{symbol}: bekleyen emir hâlâ {st} — yeni emir yok")
+            return False, OrderResult(f, a, o.get("orderId"), "UNKNOWN")
+
+        self.pending_unknown.pop(symbol, None)
+        self._save_pending()
+
+        if self._matches_pending(rec, symbol, side, q, reduce_only):
+            if f > 0:
+                logger.warning(f"{symbol}: bekleyen emir aslında {f} dolmuş ({st})")
+                return False, OrderResult(
+                    f, a, o.get("orderId"),
+                    "FILLED" if f >= q * 0.999 else "PARTIAL")
+            return True, None                      # hiç dolmamış → tekrar gönderilebilir
+
+        # Eşleşmiyor: dolum BAŞKA bir operasyona ait. Bu çağrının sonucu
+        # olarak döndürmek, bir işlemin dolumunu başka işleme yazmak olurdu.
+        if f > 0:
+            self.reconcile_needed[symbol] = (
+                f"{rec.get('side')} {f} @{a} "
+                f"({rec.get('purpose') or 'bağlamsız kayıt'}) dolmuş, "
+                f"yerel kayda işlenmedi"
+            )
+            logger.error(f"{symbol}: UZLAŞTIRMA GEREKİYOR — {self.reconcile_needed[symbol]}")
+            return False, OrderResult(0.0, 0.0, None, "UNKNOWN")
+        return True, None
+
+    # MARKET emrinin oturması için bekleme. Kısa ve sınırlı: emir terminal
+    # duruma ulaşmazsa karar vermeyiz, karantinaya alırız.
+    SETTLE_ATTEMPTS = 3
+    SETTLE_DELAY_SEC = 0.4
+
+    def _await_terminal(self, symbol, coid, o, filled, avg):
+        """Emri terminal duruma ulaşana kadar sınırlı sayıda sorgula.
+
+        Dönüş: (son_emir, dolum, ort_fiyat, terminal_mi)
+        """
+        for i in range(self.SETTLE_ATTEMPTS):
+            probe = self._recover_order(symbol, coid)
+            if isinstance(probe, dict):
+                o = probe
+                filled, avg = self._fill_of(probe)
+                if probe.get("status") in self.TERMINAL_STATUS:
+                    return o, filled, avg, True
+            elif probe is self.ORDER_ABSENT:
+                # Borsa "böyle bir emir yok" diyor — açıkta iş kalmamış
+                # demektir; bu KESİN bilgidir, karantinaya gerek yok.
+                return o, filled, avg, True
+            # None: sorgulayamadık — akıbeti bilmiyoruz, tekrar dene.
+            if i < self.SETTLE_ATTEMPTS - 1:
+                time.sleep(self.SETTLE_DELAY_SEC)
+        return o, filled, avg, False
+
     def _execute(self, symbol: str, side: str, qty: float, *,
                  reduce_only: bool = False, purpose: str = "") -> "OrderResult":
-        # Akıbeti bilinmeyen bir emir varken bu sembolde YENİ EMİR YOK.
-        stale = self.pending_unknown.get(symbol)
-        if stale:
-            o = self._recover_order(symbol, stale)
-            if o is self.ORDER_ABSENT:
-                self.pending_unknown.pop(symbol, None)      # kesin olmamış
-                self._save_pending()
-            elif o is None:
-                logger.error(f"{symbol}: önceki emrin akıbeti hâlâ bilinmiyor — emir yok")
-                return OrderResult(0.0, 0.0, None, "UNKNOWN")
-            else:
-                # DENETİM BULGUSU: sözlük dönmesi yeterli sayılıyordu ve emir
-                # hâlâ NEW / 0 dolum olsa bile karantina kaldırılıyordu — yani
-                # borsada açık duran bir emrin üstüne ikincisi gönderilebiliyordu.
-                # Karantina yalnız emir TERMİNAL bir duruma ulaşınca kalkar.
-                st = o.get("status")
-                f, a = self._fill_of(o)
-                if st in ("NEW", "PARTIALLY_FILLED"):
-                    logger.error(f"{symbol}: bekleyen emir hâlâ {st} — yeni emir yok")
-                    return OrderResult(f, a, o.get("orderId"), "UNKNOWN")
-                self.pending_unknown.pop(symbol, None)
-                self._save_pending()
-                if f > 0:
-                    logger.warning(f"{symbol}: bekleyen emir aslında {f} dolmuş ({st})")
-                    return OrderResult(f, a, o.get("orderId"), "FILLED")
-
         step, min_q = self._get_step(symbol)
         q = _round_step(qty, step)
+
+        # Akıbeti bilinmeyen bir emir varken bu sembolde YENİ EMİR YOK.
+        proceed, result = self._reconcile_pending(symbol, side, q, reduce_only)
+        if not proceed:
+            return result
+
         if q < min_q:
             return OrderResult(0.0, 0.0, None, "TOO_SMALL")
 
         coid = self._client_order_id(symbol)
+        rec = _pending_record(coid, side, q, reduce_only, purpose,
+                              datetime.now().timestamp())
         kwargs = dict(symbol=symbol, side=side, type="MARKET", quantity=q,
                       newClientOrderId=coid, newOrderRespType="RESULT")
         if reduce_only:
@@ -755,48 +912,54 @@ class FuturesTrader(ExitEngineMixin):
                 logger.warning(f"Emir borsaya ulaşmamış {symbol} {purpose}: {e}")
                 return OrderResult(0.0, 0.0, None, "NONE")
             if o is None:
-                # BİLİNMİYOR: sembol karantinaya alınır. Bekleyen kimlik
+                # BİLİNMİYOR: sembol karantinaya alınır. Bekleyen kayıt
                 # saklanmazsa bir sonraki tur aynı emri tekrar gönderebilir.
                 logger.error(f"Emir akıbeti bilinmiyor {symbol} {purpose}: "
                              f"{type(e).__name__}: {e}")
-                self.pending_unknown[symbol] = coid
+                self.pending_unknown[symbol] = rec
                 self._save_pending()
                 return OrderResult(0.0, 0.0, None, "UNKNOWN")
 
         filled, avg = self._fill_of(o)
-        if filled <= 0:
-            probe = self._recover_order(symbol, coid)
-            if isinstance(probe, dict):
-                o = probe
-                filled, avg = self._fill_of(o)
-                # Emir hâlâ AÇIK (NEW/PARTIALLY_FILLED) — "olmadı" değil,
-                # "henüz olmadı". Sonraki tur ikinci emir göndermemeli.
-                if filled <= 0 and probe.get("status") in ("NEW", "PARTIALLY_FILLED"):
-                    self.pending_unknown[symbol] = coid
-                    self._save_pending()
-                    return OrderResult(0.0, 0.0, probe.get("orderId"), "UNKNOWN")
-            elif probe is None:
-                # DENETİM BULGUSU: emir NEW/0 dönüp takip sorgusu da
-                # başarısız olursa sonuç NONE oluyordu ve sembol karantinaya
-                # ALINMIYORDU. Emir borsada açıkken sonraki tur ikinci emir
-                # gönderebilirdi.
-                logger.error(f"{symbol} {purpose}: dolum doğrulanamadı — karantina")
-                self.pending_unknown[symbol] = coid
-                self._save_pending()
-                self._save_pending()
-                return OrderResult(0.0, 0.0, None, "UNKNOWN")
 
-        status = ("FILLED" if filled >= q * 0.999
-                  else "PARTIAL" if filled > 0 else "NONE")
+        # DENETİM BULGUSU: ilk cevabın dolumu 0'dan BÜYÜKSE emir durumu hiç
+        # kontrol edilmiyordu. PARTIALLY_FILLED bir emrin kalanı borsada
+        # çalışmaya devam eder ve sonraki tur üstüne ikinci emir gidebilirdi.
+        #
+        # Belirleyici olan durum etiketi değil, ŞU: istenen miktar tamamen
+        # doldu mu? Tam dolan bir MARKET emrinden borsada iş kalmaz. Eksik
+        # dolumda ise emrin terminal olduğunu KANITLAMAK zorundayız.
+        complete = filled >= q * 0.999
+        if not complete and o.get("status") not in self.TERMINAL_STATUS:
+            # MARKET emri saniyeler içinde terminal duruma oturur. Tek sorguda
+            # pes etmek, normal bir gecikmeyi patolojik durum gibi gösterir.
+            o, filled, avg, terminal = self._await_terminal(symbol, coid, o, filled, avg)
+            complete = filled >= q * 0.999
+            if not complete and not terminal:
+                st = o.get("status") if isinstance(o, dict) else "?"
+                logger.error(f"{symbol} {purpose}: emir terminal değil ({st}), "
+                             f"dolan {filled}/{q} — karantina")
+                self.pending_unknown[symbol] = rec
+                self._save_pending()
+                return OrderResult(filled, avg,
+                                   o.get("orderId") if isinstance(o, dict) else None,
+                                   "UNKNOWN")
+
+        status = "FILLED" if complete else ("PARTIAL" if filled > 0 else "NONE")
         if status == "PARTIAL":
             logger.warning(f"{symbol} {purpose}: kısmi dolum {filled}/{q}")
-        return OrderResult(filled, avg, o.get("orderId") if o else None, status)
+        return OrderResult(filled, avg,
+                           o.get("orderId") if isinstance(o, dict) else None, status)
 
     def _save_pending(self) -> None:
         try:
             state_set_many({"pending_unknown_orders": self.pending_unknown})
+            self.pending_state_ok = True
         except Exception as e:
-            logger.debug(f"Karantina kaydedilemedi: {e}")
+            # DENETİM BULGUSU: bu hata yutuluyordu. Kayıt diske yazılamazsa
+            # restart koruması yoktur; sessiz kalmak o korumayı hayalî yapar.
+            self.pending_state_ok = False
+            logger.error(f"KARANTİNA KAYDEDİLEMEDİ {self.pending_unknown}: {e}")
 
     def _client_order_id(self, symbol: str) -> str:
         """
@@ -878,6 +1041,12 @@ class FuturesTrader(ExitEngineMixin):
                       entry_snapshot=None):
         if symbol in self.positions:
             return False, "Zaten açık"
+        # Ölçemediğimiz ya da bilmediğimiz bir durumda YENİ RİSK ALINMAZ.
+        # Çıkışlar bu kapıdan geçmez; yalnız giriş durur.
+        if self.equity_stale:
+            return False, "Equity ölçülemiyor, yeni pozisyon açılmıyor"
+        if not self.pending_state_ok:
+            return False, "Karantina durumu okunamıyor, yeni pozisyon açılmıyor"
         try:
             if not self._set_leverage(symbol, leverage):
                 return False, f"Kaldıraç ayarlanamadı ({leverage}x), pozisyon açılmadı"
@@ -1437,46 +1606,65 @@ class FuturesTrader(ExitEngineMixin):
                     # kısmi çıkışları ZATEN içeriyor; üstüne yerel
                     # `realized_pnl` eklemek aynı kârı İKİ KEZ sayıyordu.
                     pnl = None
+                    pnl_verified = True
                     close_px = pos["entry_price"]
+                    since = int(pos["open_time"].timestamp() * 1000)
                     try:
-                        since = int(pos["open_time"].timestamp() * 1000)
                         income = self.client.futures_income_history(
                             symbol=sym, incomeType="REALIZED_PNL",
                             startTime=since, limit=50,
                         )
                         if income:
                             pnl = sum(float(i["income"]) for i in income)
-                        # DENETİM: yalnız REALIZED_PNL okunuyordu; komisyon ve
-                        # funding net sonuçtan düşülmüyordu. Kill switch gerçek
-                        # NET zarar yerine daha iyimser BRÜT PnL görüyordu.
+                    except Exception as e:
+                        pnl_verified = False
+                        logger.error(f"SYNC: {sym} PnL geçmişi okunamadı: {e}")
+                    # DENETİM: yalnız REALIZED_PNL okunuyordu; komisyon ve
+                    # funding net sonuçtan düşülmüyordu. Kill switch gerçek
+                    # NET zarar yerine daha iyimser BRÜT PnL görüyordu.
+                    if pnl is not None:
                         for kind in ("COMMISSION", "FUNDING_FEE"):
                             try:
                                 extra = self.client.futures_income_history(
                                     symbol=sym, incomeType=kind,
                                     startTime=since, limit=50,
                                 )
-                                if extra and pnl is not None:
+                                if extra:
                                     pnl += sum(float(i["income"]) for i in extra)
                             except Exception as ie:
-                                logger.warning(f"SYNC: {sym} {kind} okunamadı: {ie}")
-                    except Exception as e:
-                        logger.error(f"SYNC: {sym} PnL geçmişi okunamadı: {e}")
+                                # DENETİM BULGUSU: bu yalnız uyarı yazıyordu ve
+                                # EKSİK sonuç kill switch'e "ölçülmüş" gibi
+                                # gidiyordu. Net'in bir bileşeni okunamadıysa
+                                # sonuç DOĞRULANMIŞ değildir.
+                                pnl_verified = False
+                                logger.error(f"SYNC: {sym} {kind} okunamadı: {ie}")
                     try:
                         tk = self.client.futures_symbol_ticker(symbol=sym)
                         close_px = float(tk["price"])
                     except Exception:
                         pass
 
+                    # Ölçemiyorsak "kâr yok" saymak yerine, en kötü bilinen
+                    # durumu kullan: kalan pozisyon stop'a çarpmış.
+                    est = -abs(pos["entry_price"] - pos.get("stop_loss", pos["entry_price"])) * pos["qty"]
                     if pnl is None:
-                        # Ölçemiyorsak "kâr yok" saymak yerine, en kötü
-                        # bilinen durumu kullan: kalan pozisyon stop'a çarpmış.
-                        est = -abs(pos["entry_price"] - pos.get("stop_loss", pos["entry_price"])) * pos["qty"]
                         pnl = est
-                        self.unprotected[sym] = "kapanış PnL'i doğrulanamadı (tahmini kullanıldı)"
+                        self.pnl_unverified[sym] = "kapanış PnL'i ölçülemedi (stop zararı varsayıldı)"
                         logger.error(
                             f"SYNC: {sym} PnL doğrulanamadı — stop zararı varsayıldı ({pnl:+.2f}$)"
                         )
                         total_net = pnl + pos.get("realized_pnl", 0.0)
+                    elif not pnl_verified:
+                        # Net'in bir bileşeni okunamadı. Ölçülen sayı EKSİK,
+                        # yani gerçekten daha iyimser. Kill switch'e iyimser
+                        # olanı göndermeyiz: iki tahminin kötüsü kullanılır.
+                        total_net = min(pnl, est)
+                        pnl = total_net
+                        self.pnl_unverified[sym] = "kapanış PnL'i eksik bileşenli (muhafazakâr değer)"
+                        logger.error(
+                            f"SYNC: {sym} net PnL doğrulanamadı — muhafazakâr "
+                            f"değer kullanıldı ({total_net:+.2f}$)"
+                        )
                     else:
                         # Borsa geçmişi kısmi çıkışları zaten içerir.
                         total_net = pnl

@@ -44,6 +44,7 @@ def _trader(tick="0.01"):
         cl.futures_account_balance.return_value = [{"asset": "USDT", "balance": "1000.0"}]
         t = FuturesTrader()
         t.balance = 1000.0
+        t.SETTLE_DELAY_SEC = 0        # testlerde gerçek beklemeye gerek yok
         return t
 
 
@@ -370,6 +371,10 @@ def test_partial_fill_uses_actual_quantity():
     t.client.futures_create_order.return_value = {
         "orderId": 5, "executedQty": "0.6", "avgPrice": "100.0", "status": "PARTIALLY_FILLED",
     }
+    # Kalan dolmadan EXPIRED oldu: borsada iş kalmadı, gerçekleşen 0.6.
+    t.client.futures_get_order.return_value = {
+        "orderId": 5, "executedQty": "0.6", "avgPrice": "100.0", "status": "EXPIRED",
+    }
     ok, _ = t.open_position("TESTUSDT", "BUY", 100.0, 50.0, 3, 98.0, 107.0,
                             qty=1.0, risk_amount=2.0)
     assert ok
@@ -569,8 +574,9 @@ def test_partial_exit_uses_actual_filled_quantity():
     pos["qty"] = 1.0
     pos["initial_qty"] = 1.0
     t.positions["TESTUSDT"] = pos
+    # Gerçekçi cevap: kısmi dolan MARKET emrinin kalanı EXPIRED olur.
     t.client.futures_create_order.return_value = {
-        "orderId": 4, "executedQty": "0.1", "avgPrice": "102.0",
+        "orderId": 4, "executedQty": "0.1", "avgPrice": "102.0", "status": "EXPIRED",
     }
 
     t._apply_partial(pos, 0.4, 102.0, "TP1_PARTIAL")
@@ -745,8 +751,9 @@ def test_partial_fill_does_not_complete_tp_target():
     t = _trader()
     pos = _pos()
     pos.update(qty=1.0, initial_qty=1.0)
+    # Gerçekçi cevap: kısmi dolan MARKET emrinin kalanı EXPIRED olur.
     t.client.futures_create_order.return_value = {
-        "orderId": 4, "executedQty": "0.1", "avgPrice": "102.0",
+        "orderId": 4, "executedQty": "0.1", "avgPrice": "102.0", "status": "EXPIRED",
     }
 
     t._apply_partial(pos, 0.4, 102.0, "TP1_PARTIAL")
@@ -762,12 +769,14 @@ def test_partial_target_completes_across_retries():
     pos = _pos()
     pos.update(qty=1.0, initial_qty=1.0)
     t.client.futures_create_order.return_value = {
-        "orderId": 4, "executedQty": "0.1", "avgPrice": "102.0"}
+        "orderId": 4, "executedQty": "0.1", "avgPrice": "102.0",
+        "status": "EXPIRED"}
     t._apply_partial(pos, 0.4, 102.0, "TP1_PARTIAL")
     assert pos["tp1_done"] is False
 
     t.client.futures_create_order.return_value = {
-        "orderId": 5, "executedQty": "0.3", "avgPrice": "102.0"}
+        "orderId": 5, "executedQty": "0.3", "avgPrice": "102.0",
+        "status": "EXPIRED"}
     t._apply_partial(pos, 0.4, 102.0, "TP1_PARTIAL")
     assert pos["tp1_done"] is True, "hedef tamamlandığı hâlde kapanmadı"
 
@@ -841,7 +850,8 @@ def test_partial_retry_sends_only_the_remainder():
 
     def create(**kw):
         sent.append(kw["quantity"])
-        return {"orderId": 1, "executedQty": "0.1", "avgPrice": "102.0"}
+        return {"orderId": 1, "executedQty": "0.1", "avgPrice": "102.0",
+                "status": "EXPIRED"}
 
     t.client.futures_create_order.side_effect = create
     pos = _pos()
@@ -1011,7 +1021,8 @@ def test_quarantine_survives_restart():
     assert t.pending_unknown
 
     import trader as tr
-    assert tr._load_pending_unknown().get("TESTUSDT"), "karantina diske yazılmadı"
+    saved, ok = tr._load_pending_unknown()
+    assert ok and saved.get("TESTUSDT"), "karantina diske yazılmadı"
 
 
 def test_margin_mode_failure_blocks_entry():
@@ -1064,3 +1075,363 @@ def test_exchange_close_pnl_includes_commission_and_funding():
     assert t.exchange_closed
     assert t.exchange_closed[0][2] == pytest.approx(8.0), \
         f"brüt 10 yerine net 8 bekleniyordu, gelen {t.exchange_closed[0][2]}"
+
+
+# ── 7. denetim turu ───────────────────────────────────────────────────────────
+
+def test_partially_filled_order_is_quarantined():
+    """
+    DENETİM BULGUSU: ilk cevabın dolumu 0'dan BÜYÜKSE emir durumu hiç kontrol
+    edilmiyordu. PARTIALLY_FILLED bir emrin kalanı borsada çalışmaya devam
+    eder; sonraki tur üstüne ikinci emir gönderilirse fazladan pozisyon açılır.
+    """
+    t = _trader()
+    t.client.futures_create_order.return_value = {
+        "orderId": 7, "executedQty": "0.4", "avgPrice": "100.0",
+        "status": "PARTIALLY_FILLED",
+    }
+    t.client.futures_get_order.return_value = {
+        "orderId": 7, "executedQty": "0.4", "avgPrice": "100.0",
+        "status": "PARTIALLY_FILLED",
+    }
+
+    res = t._execute("TESTUSDT", "BUY", 1.0, purpose="giriş")
+
+    assert res.status == "UNKNOWN", f"kalan borsada çalışırken {res.status} döndü"
+    assert t.pending_unknown.get("TESTUSDT"), "kısmi dolan açık emir karantinaya alınmadı"
+
+    # Asıl kanıt: sonraki tur bu sembole YENİ EMİR GÖNDERMEMELİ.
+    before = t.client.futures_create_order.call_count
+    t._execute("TESTUSDT", "BUY", 1.0, purpose="giriş")
+    assert t.client.futures_create_order.call_count == before, \
+        "kalanı borsada çalışan emrin üstüne ikinci emir gönderildi"
+
+
+def test_terminal_partial_fill_is_not_quarantined():
+    """Kalan EXPIRED olduysa borsada iş kalmamıştır — karantina gereksizdir."""
+    t = _trader()
+    t.client.futures_create_order.return_value = {
+        "orderId": 8, "executedQty": "0.4", "avgPrice": "100.0",
+        "status": "EXPIRED",
+    }
+    res = t._execute("TESTUSDT", "BUY", 1.0, purpose="giriş")
+    assert res.status == "PARTIAL" and res.filled == pytest.approx(0.4)
+    assert "TESTUSDT" not in t.pending_unknown
+
+
+def test_pending_order_from_another_operation_is_not_claimed():
+    """
+    DENETİM BULGUSU: karantina yalnız symbol→clientOrderId tutuyordu. Bekleyen
+    bir SELL/reduceOnly KAPANIŞ emri, sonraki BUY GİRİŞ çağrısına "başarılı
+    giriş" sonucu olarak dönüyordu — bir operasyonun dolumu başka bir
+    operasyona yazılıyordu.
+    """
+    t = _trader()
+    t.pending_unknown["TESTUSDT"] = {
+        "coid": "cb-kapanis", "side": "SELL", "qty": 1.0,
+        "reduce_only": True, "purpose": "kapama", "ts": 0,
+    }
+    t.client.futures_get_order.return_value = {
+        "orderId": 3, "status": "FILLED", "executedQty": "1.0", "avgPrice": "99.0",
+    }
+    before = t.client.futures_create_order.call_count
+
+    res = t._execute("TESTUSDT", "BUY", 1.0, purpose="giriş")
+
+    assert res.status == "UNKNOWN", \
+        f"kapanış emrinin dolumu girişe {res.status} olarak yazıldı"
+    assert res.filled == 0.0, "yabancı emrin dolumu bu çağrının sonucu sayıldı"
+    assert t.client.futures_create_order.call_count == before
+    assert "TESTUSDT" in t.reconcile_needed, "işlenmemiş dolum raporlanmadı"
+
+
+def test_pending_order_with_different_side_is_not_claimed():
+    """Yalnız YÖN farklı — tek boyutu izole eden test.
+
+    Not: bu ayrım gerekliydi. İlk yazdığım tek test hem yönü hem reduceOnly'yi
+    birlikte değiştiriyordu; yön kontrolünü bozan bir mutasyon testten sağ
+    çıkıyordu, çünkü reduceOnly kontrolü zaten yakalıyordu.
+    """
+    t = _trader()
+    t.pending_unknown["TESTUSDT"] = {
+        "coid": "cb-short", "side": "SELL", "qty": 1.0,
+        "reduce_only": False, "purpose": "giriş", "ts": 0,
+    }
+    t.client.futures_get_order.return_value = {
+        "orderId": 3, "status": "FILLED", "executedQty": "1.0", "avgPrice": "99.0",
+    }
+    res = t._execute("TESTUSDT", "BUY", 1.0, purpose="giriş")
+    assert res.status == "UNKNOWN" and res.filled == 0.0, \
+        "ters yöndeki emrin dolumu bu çağrıya yazıldı"
+
+
+def test_pending_order_with_different_qty_is_not_claimed():
+    """Yalnız MİKTAR farklı."""
+    t = _trader()
+    t.pending_unknown["TESTUSDT"] = {
+        "coid": "cb-buyuk", "side": "BUY", "qty": 5.0,
+        "reduce_only": False, "purpose": "giriş", "ts": 0,
+    }
+    t.client.futures_get_order.return_value = {
+        "orderId": 3, "status": "FILLED", "executedQty": "5.0", "avgPrice": "99.0",
+    }
+    res = t._execute("TESTUSDT", "BUY", 1.0, purpose="giriş")
+    assert res.status == "UNKNOWN" and res.filled == 0.0, \
+        "5.0'lık emrin dolumu 1.0'lık çağrıya yazıldı"
+
+
+def test_pending_order_with_different_reduce_only_is_not_claimed():
+    """
+    Yalnız reduceOnly farklı: bekleyen emir bir LONG KAPANIŞI (SELL/reduceOnly),
+    şimdiki çağrı ise bir SHORT GİRİŞİ (SELL). İkisi de SELL — yön kontrolü bu
+    ikisini ayıramaz, ayıran tek şey reduceOnly'dir.
+    """
+    t = _trader()
+    t.pending_unknown["TESTUSDT"] = {
+        "coid": "cb-kapanis", "side": "SELL", "qty": 1.0,
+        "reduce_only": True, "purpose": "kapama", "ts": 0,
+    }
+    t.client.futures_get_order.return_value = {
+        "orderId": 3, "status": "FILLED", "executedQty": "1.0", "avgPrice": "99.0",
+    }
+    res = t._execute("TESTUSDT", "SELL", 1.0, reduce_only=False, purpose="giriş")
+    assert res.status == "UNKNOWN" and res.filled == 0.0, \
+        "kapanış emrinin dolumu short girişine yazıldı"
+
+
+def test_legacy_string_quarantine_record_is_never_claimed():
+    """
+    Eski sürüm diske düz clientOrderId yazıyordu. Restart sonrası o kayıt
+    okunabilir olmalı ama BAĞLAMI yoktur — hiçbir çağrıyla eşleşmemeli,
+    yalnız yeni emri bloke etmeli.
+    """
+    import trader as tr
+    rec = tr._normalize_pending("cb-eski-format")
+    assert rec is not None and rec["coid"] == "cb-eski-format"
+
+    t = _trader()
+    t.pending_unknown["TESTUSDT"] = rec
+    t.client.futures_get_order.return_value = {
+        "orderId": 3, "status": "FILLED", "executedQty": "1.0", "avgPrice": "99.0",
+    }
+    before = t.client.futures_create_order.call_count
+    res = t._execute("TESTUSDT", "BUY", 1.0, purpose="giriş")
+    assert res.filled == 0.0, "bağlamsız kayıt bu çağrının sonucu sayıldı"
+    assert t.client.futures_create_order.call_count == before
+    assert "TESTUSDT" in t.reconcile_needed
+
+
+def test_zero_qty_record_never_matches_a_tiny_order():
+    """
+    Miktarsız bir kayıt, lot adımı kadar küçük bir emirle YANLIŞLIKLA
+    eşleşebilir: |0 - 0.001| <= max(step, 0) sağlanır. Bu yüzden "miktar
+    bilinmiyorsa eşleşme yok" kuralı ayrıca gereklidir.
+    """
+    t = _trader()                     # stepSize = 0.001
+    t.pending_unknown["TESTUSDT"] = {
+        "coid": "cb-bos", "side": "BUY", "qty": 0.0,
+        "reduce_only": False, "purpose": "", "ts": 0,
+    }
+    t.client.futures_get_order.return_value = {
+        "orderId": 3, "status": "FILLED", "executedQty": "0.001", "avgPrice": "99.0",
+    }
+    res = t._execute("TESTUSDT", "BUY", 0.001, purpose="giriş")
+    assert res.filled == 0.0, "miktarı bilinmeyen kayıt küçük emirle eşleşti"
+
+
+def test_quarantine_read_failure_is_reported():
+    """
+    DENETİM BULGUSU: okuma hatası yutuluyordu. Karantinayı okuyamadıysak
+    bekleyen emir olup olmadığını BİLMİYORUZ; "temiz" rapor etmek, restart
+    korumasını sessizce ortadan kaldırır.
+    """
+    import trader as tr
+    with patch("trader.state_get", side_effect=RuntimeError("DB kilitli")):
+        recs, ok = tr._load_pending_unknown()
+    assert ok is False, "okuma hatası 'durum temiz' olarak raporlandı"
+
+    # Bozuk tipte kayıt da güvenilir sayılmamalı.
+    with patch("trader.state_get", return_value="beklenmeyen"):
+        _, ok2 = tr._load_pending_unknown()
+    assert ok2 is False
+
+
+def test_pending_order_from_same_operation_is_claimed():
+    """Aynı operasyona ait bekleyen emir sahiplenilmeli — aksi hâlde
+    kurtarma mekanizması hiçbir işe yaramaz."""
+    t = _trader()
+    t.pending_unknown["TESTUSDT"] = {
+        "coid": "cb-giris", "side": "BUY", "qty": 1.0,
+        "reduce_only": False, "purpose": "giriş", "ts": 0,
+    }
+    t.client.futures_get_order.return_value = {
+        "orderId": 3, "status": "FILLED", "executedQty": "1.0", "avgPrice": "99.0",
+    }
+    before = t.client.futures_create_order.call_count
+
+    res = t._execute("TESTUSDT", "BUY", 1.0, purpose="giriş")
+
+    assert res.status == "FILLED" and res.filled == pytest.approx(1.0)
+    assert res.avg_price == pytest.approx(99.0)
+    assert t.client.futures_create_order.call_count == before, "emir tekrar gönderildi"
+    assert "TESTUSDT" not in t.pending_unknown
+
+
+def test_pending_record_persists_full_context():
+    """Diske yalnız clientOrderId yazılırsa restart'tan sonra eşleştirme
+    yapılamaz ve aynı boşluk geri gelir."""
+    import trader as tr
+    t = _trader()
+    t.client.futures_create_order.side_effect = TimeoutError("koptu")
+    t.client.futures_get_order.side_effect = TimeoutError("koptu")
+    t._execute("TESTUSDT", "SELL", 1.0, reduce_only=True, purpose="kapama")
+
+    saved, ok = tr._load_pending_unknown()
+    rec = saved.get("TESTUSDT")
+    assert ok and rec, "karantina diske yazılmadı"
+    assert rec["side"] == "SELL"
+    assert rec["reduce_only"] is True
+    assert rec["qty"] == pytest.approx(1.0)
+    assert rec["coid"]
+
+
+def test_unverified_close_pnl_is_not_reported_as_measured():
+    """
+    DENETİM BULGUSU: komisyon/funding sorgusu başarısız olunca yalnız uyarı
+    yazılıyor ve EKSİK sonuç kill switch'e "ölçülmüş" gibi gidiyordu. Net'in
+    bir bileşeni okunamadıysa sonuç doğrulanmış sayılamaz.
+    """
+    t = _trader()
+    t.positions["TESTUSDT"] = _pos()
+    t.client.futures_position_information.return_value = []
+    t.client.futures_symbol_ticker.return_value = {"price": "101.0"}
+
+    def income(**kw):
+        if kw.get("incomeType") == "REALIZED_PNL":
+            return [{"income": "10.0"}]
+        if kw.get("incomeType") == "FUNDING_FEE":
+            return [{"income": "-0.5"}]
+        raise TimeoutError("komisyon okunamadı")
+
+    t.client.futures_income_history.side_effect = income
+    t.sync_positions()
+
+    assert t.exchange_closed
+    recorded = t.exchange_closed[0][2]
+    assert recorded < 0, f"eksik bileşenli sonuç +{recorded} olarak ölçülmüş sayıldı"
+    assert "TESTUSDT" in t.pnl_unverified, "doğrulanamayan PnL raporlanmadı"
+    # Geçici bir sorgu hatası botu kalıcı olarak durdurmamalı: muhafazakâr
+    # değer zaten kill switch'e gidiyor.
+    assert "TESTUSDT" not in t.reconcile_needed, \
+        "geçici sorgu hatası kalıcı işlem duruşuna çevrildi"
+
+
+def test_equity_failure_blocks_new_entries():
+    """
+    DENETİM BULGUSU: `totalMarginBalance` okunamazsa kod `crossUnPnl` hesabına
+    düşüyordu — ISOLATED modda izole zararı GÖRMEYEN, yani tam da düzeltilen
+    yanlış equity. Yanlış sayı üretmektense giriş durur.
+    """
+    t = _trader()
+    t.client.futures_account.side_effect = TimeoutError("koptu")
+    t.client.futures_account_balance.return_value = [
+        {"asset": "USDT", "balance": "1000.0", "crossUnPnl": "100.0"},
+    ]
+
+    eq = t.equity
+    assert eq != pytest.approx(1100.0), "izole zararı görmeyen crossUnPnl'e düşüldü"
+    assert t.equity_stale is True
+
+    before = t.client.futures_create_order.call_count
+    ok, msg = t.open_position("TESTUSDT", "BUY", 100.0, 50.0, 3, 98.0, 107.0,
+                              qty=1.0, risk_amount=2.0)
+    assert ok is False and "Equity" in msg
+    assert t.client.futures_create_order.call_count == before
+
+
+def test_unreadable_quarantine_state_blocks_new_entries():
+    """
+    DENETİM BULGUSU: karantina okuma/yazma hataları yutuluyordu. Bekleyen emir
+    olup olmadığını bilmiyorsak yeni risk alınmaz.
+    """
+    t = _trader()
+    t.pending_state_ok = False
+    before = t.client.futures_create_order.call_count
+
+    ok, msg = t.open_position("TESTUSDT", "BUY", 100.0, 50.0, 3, 98.0, 107.0,
+                              qty=1.0, risk_amount=2.0)
+
+    assert ok is False and "Karantina" in msg
+    assert t.client.futures_create_order.call_count == before
+
+
+def test_quarantine_save_failure_is_surfaced():
+    """Yazma başarısızsa restart koruması yoktur; sessiz kalmak onu hayalî yapar."""
+    t = _trader()
+    with patch("trader.state_set_many", side_effect=RuntimeError("DB kilitli")):
+        t.pending_unknown["TESTUSDT"] = {"coid": "x", "side": "BUY", "qty": 1.0,
+                                         "reduce_only": False, "purpose": "", "ts": 0}
+        t._save_pending()
+    assert t.pending_state_ok is False, "kayıt hatası yutuldu"
+
+
+def test_unknown_fill_is_not_treated_as_settled():
+    """
+    TÜKETİCİ DAVRANIŞI: `OrderResult.ok` yalnız `filled > 0` bakıyordu. Kalanı
+    borsada çalışan bir emrin kısmi dolumu "olmuş" sayılıp yerele işleniyordu;
+    kalan sonradan dolunca borsadaki pozisyon yereldekinden BÜYÜK kalıyordu.
+    """
+    from trader import OrderResult
+    assert OrderResult(0.4, 100.0, 1, "UNKNOWN").ok is False
+    assert OrderResult(0.4, 100.0, 1, "PARTIAL").ok is True
+    assert OrderResult(1.0, 100.0, 1, "FILLED").ok is True
+
+    # Uçtan uca: kalanı çalışan emirle pozisyon AÇILMAMALI.
+    t = _trader()
+    open_resp = {"orderId": 7, "executedQty": "0.4", "avgPrice": "100.0",
+                 "status": "PARTIALLY_FILLED"}
+    t.client.futures_create_order.return_value = open_resp
+    t.client.futures_get_order.return_value = open_resp
+
+    ok, _ = t.open_position("TESTUSDT", "BUY", 100.0, 50.0, 3, 98.0, 107.0,
+                            qty=1.0, risk_amount=2.0)
+    assert ok is False, "doğrulanmamış kısmi dolumla pozisyon açıldı"
+    assert "TESTUSDT" not in t.positions
+
+
+def test_execute_waits_for_market_order_to_settle():
+    """
+    MARKET emri saniyeler içinde oturur. Tek sorguda pes etmek, normal bir
+    gecikmeyi patolojik durum gibi gösterir ve pozisyonu gereksiz yere
+    karantinaya atar — üstelik borsada stop'suz bakiye bırakarak.
+    """
+    t = _trader()
+    t.client.futures_create_order.return_value = {
+        "orderId": 7, "executedQty": "0", "status": "NEW",
+    }
+    seq = [
+        {"orderId": 7, "executedQty": "0", "status": "NEW"},
+        {"orderId": 7, "executedQty": "1.0", "avgPrice": "100.0", "status": "FILLED"},
+    ]
+    t.client.futures_get_order.side_effect = seq
+
+    res = t._execute("TESTUSDT", "BUY", 1.0, purpose="giriş")
+
+    assert res.status == "FILLED" and res.filled == pytest.approx(1.0)
+    assert "TESTUSDT" not in t.pending_unknown
+    assert t.client.futures_get_order.call_count == 2, "tek sorguda pes edildi"
+
+
+def test_settle_wait_is_bounded():
+    """Bekleme sınırsız olamaz: emir oturmuyorsa karantina."""
+    t = _trader()
+    t.client.futures_create_order.return_value = {
+        "orderId": 7, "executedQty": "0", "status": "NEW"}
+    t.client.futures_get_order.return_value = {
+        "orderId": 7, "executedQty": "0", "status": "NEW"}
+
+    res = t._execute("TESTUSDT", "BUY", 1.0, purpose="giriş")
+
+    assert res.status == "UNKNOWN"
+    assert t.client.futures_get_order.call_count == t.SETTLE_ATTEMPTS
+    assert t.pending_unknown.get("TESTUSDT")

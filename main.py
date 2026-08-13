@@ -656,6 +656,11 @@ def run():
             guard_issues = {
                 **{s: f"korumasız ({r})" for s, r in getattr(trader, "unprotected", {}).items()},
                 **{s: f"sahipsiz ({r})" for s, r in getattr(trader, "orphans", {}).items()},
+                # Borsada gerçekleşmiş ama yerel kayda işlenmemiş dolum /
+                # doğrulanamamış kapanış PnL'i. Kayıt ile borsa ayrıştığı için
+                # pozisyon boyutu da risk hesabı da güvenilmezdir.
+                **{s: f"uzlaştırma gerekli ({r})"
+                   for s, r in getattr(trader, "reconcile_needed", {}).items()},
             }
             if guard_issues:
                 can_trade = False
