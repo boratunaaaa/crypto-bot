@@ -758,6 +758,16 @@ def run():
                 # Momentum stratejisi kendi izole bütçesini aşamaz
                 if strategy == "MOMENTUM_FAST":
                     ok_mom, mom_reason = kill_switch.can_trade(equity, strategy="MOMENTUM_FAST")
+                    # DENETİM: alt bütçe ADAY DAHİL EDİLMEDEN kontrol
+                    # ediliyordu — kalan 0.4R iken 1.3R'lik aday kabul
+                    # edilebiliyordu. Ana bütçede bu kontrol vardı, alt
+                    # bütçede atlanmıştı.
+                    if ok_mom and kill_switch.momentum_budget_remaining() < alloc_r:
+                        ok_mom = False
+                        mom_reason = (
+                            f"Momentum bütçesi yetersiz "
+                            f"({kill_switch.momentum_budget_remaining():.2f}R < {alloc_r:.2f}R)"
+                        )
                     if not ok_mom:
                         save_missed_signal(
                             sig.symbol, sig.action, sig.score, sig.confidence,

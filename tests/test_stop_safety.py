@@ -675,3 +675,130 @@ def test_sync_failure_is_fail_closed():
     t.sync_positions()
 
     assert "TESTUSDT" in t.unprotected
+
+
+# ── Dördüncü tur: tek emir hattı (2026-08-13, Codex) ─────────────────────────
+
+def test_all_order_paths_carry_client_id_and_result_type():
+    """
+    YAPISAL GARANTİ. Giriş, kısmi çıkış, tam çıkış ve acil çıkış dört ayrı kod
+    yoluydu; üç denetim turu boyunca her seferinde biri idempotency veya dolum
+    doğrulamasından yoksun kaldı. Artık hepsi `_execute` üzerinden geçiyor —
+    bu test o garantiyi kilitler.
+    """
+    t = _trader()
+    t.client.futures_position_information.return_value = []
+    # Emir yanıtı istenen miktarı yansıtsın; sabit executedQty pozisyon
+    # muhasebesini bozar ve testin ölçmek istediği şeyi gizler.
+    t.client.futures_create_order.side_effect = lambda **kw: {
+        "orderId": 1, "avgPrice": "100.0", "status": "FILLED",
+        "executedQty": str(kw.get("quantity", 0)),
+    }
+
+    t.open_position("TESTUSDT", "BUY", 100.0, 50.0, 3, 98.0, 107.0,
+                    qty=1.0, risk_amount=2.0)
+    pos = t.positions["TESTUSDT"]
+    pos["initial_qty"] = 1.0
+    t._apply_partial(pos, 0.4, 102.0, "TP1_PARTIAL")
+    t.close_position("TESTUSDT", 103.0, reason="MANUAL")
+
+    market = [c for c in t.client.futures_create_order.call_args_list
+              if c.kwargs.get("type") == "MARKET"]
+    assert len(market) >= 3, "beklenen emir yolları çalışmadı"
+    for c in market:
+        assert c.kwargs.get("newClientOrderId"), "clientOrderId olmayan emir yolu var"
+        assert c.kwargs.get("newOrderRespType") == "RESULT", "ACK ile yetinen emir yolu var"
+
+
+def test_partial_fill_does_not_complete_tp_target():
+    """
+    0.4 istenip 0.1 dolduğunda: miktar doğru düşülür AMA hedef tamamlanmış
+    sayılmaz. Aksi hâlde kalan 0.3 bir daha denenmez ve kâr realize edilmeden
+    stop başabaşa taşınır — koruma bedavaya gevşer.
+    """
+    t = _trader()
+    pos = _pos()
+    pos.update(qty=1.0, initial_qty=1.0)
+    t.client.futures_create_order.return_value = {
+        "orderId": 4, "executedQty": "0.1", "avgPrice": "102.0",
+    }
+
+    t._apply_partial(pos, 0.4, 102.0, "TP1_PARTIAL")
+
+    assert pos["qty"] == pytest.approx(0.9)
+    assert pos["tp1_done"] is False, "kısmi dolum hedefi tamamlanmış sayıldı"
+    assert pos["stop_loss"] == 95.0, "hedef dolmadan stop başabaşa taşındı"
+
+
+def test_partial_target_completes_across_retries():
+    """Eksik kalan miktar sonraki turda tamamlanınca hedef kapanmalı."""
+    t = _trader()
+    pos = _pos()
+    pos.update(qty=1.0, initial_qty=1.0)
+    t.client.futures_create_order.return_value = {
+        "orderId": 4, "executedQty": "0.1", "avgPrice": "102.0"}
+    t._apply_partial(pos, 0.4, 102.0, "TP1_PARTIAL")
+    assert pos["tp1_done"] is False
+
+    t.client.futures_create_order.return_value = {
+        "orderId": 5, "executedQty": "0.3", "avgPrice": "102.0"}
+    t._apply_partial(pos, 0.4, 102.0, "TP1_PARTIAL")
+    assert pos["tp1_done"] is True, "hedef tamamlandığı hâlde kapanmadı"
+
+
+def test_stop_verification_distinguishes_unknown_from_absent():
+    """
+    Geçici bağlantı hatası "stop yok" sayılmamalı — bot o an ikinci bir stop
+    kurup borsada duplicate emir bırakır. VAR / YOK / BİLİNMİYOR üç durum.
+    """
+    t = _trader()
+    t.client.futures_get_order.return_value = {"status": "NEW"}
+    assert t._verify_stop_exists("TESTUSDT", 1) is True
+
+    t.client.futures_get_order.side_effect = _api_error(-2013)      # emir yok
+    assert t._verify_stop_exists("TESTUSDT", 1) is False
+
+    t.client.futures_get_order.side_effect = TimeoutError("koptu")  # bilinmiyor
+    assert t._verify_stop_exists("TESTUSDT", 1) is None
+
+
+def test_emergency_close_reaches_kill_switch():
+    """
+    Acil kapama başarılı olduğunda pozisyon sessizce silinmemeli: gerçekleşen
+    zarar günlük limite ve ardışık kayıp sayacına yansımalı.
+    """
+    t = _trader()
+    pos = _pos(stop=98.0)
+    t.positions["TESTUSDT"] = pos
+    t.client.futures_get_order.side_effect = _api_error(-2013)
+    t.client.futures_position_information.return_value = []
+
+    def create(**kw):
+        if kw.get("type") == "STOP_MARKET":
+            raise _api_error(-2021)
+        return {"orderId": 9, "executedQty": "1.0", "avgPrice": "94.0"}
+
+    t.client.futures_create_order.side_effect = create
+    t._sync_protective_stop(pos)
+
+    assert t.exchange_closed, "acil kapanış kill switch kuyruğuna girmedi"
+    assert t.exchange_closed[0][1] == "EMERGENCY_CLOSE"
+    assert t.exchange_closed[0][2] < 0, "zarar kaydedilmedi"
+
+
+def test_unverifiable_exchange_pnl_is_not_recorded_as_zero():
+    """
+    Income sorgusu başarısızsa işlem 0 PnL ile kapanmış kaydediliyordu; kill
+    switch gerçek zararı görmüyordu. Ölçemiyorsak en kötü bilinen durumu al.
+    """
+    t = _trader()
+    t.positions["TESTUSDT"] = _pos(stop=95.0)
+    t.client.futures_position_information.return_value = []
+    t.client.futures_income_history.side_effect = TimeoutError("koptu")
+    t.client.futures_symbol_ticker.return_value = {"price": "95.0"}
+    t.client.futures_account_balance.return_value = [{"asset": "USDT", "balance": "990"}]
+
+    t.sync_positions()
+
+    assert t.exchange_closed
+    assert t.exchange_closed[0][2] < 0, "doğrulanamayan kapanış 0 PnL sayıldı"

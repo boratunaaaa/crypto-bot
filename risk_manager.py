@@ -127,9 +127,15 @@ class KillSwitchTracker:
             # İade, o işleme AYRILAN R ile sınırlı — sabit 1.0 değil. Yarım
             # riskle açılmış bir işlem bütçeye tam 1R geri veremez, aksi hâlde
             # bütçe küçük risklerle sonsuza kadar şişer.
+            # DENETİM BULGUSU: `realized_r` pozisyonun KENDİ R'si cinsinden
+            # (kâr / pozisyonun kendi risk_amount'ı), ama `daily_risk_used_r`
+            # `allocated_r` biriminde tutuluyor. İkisi karıştırılınca:
+            # 0.533R ağırlıklı bir işlem kendi riskinin +0.5R'sini kazanınca
+            # bütçeye 0.5R iade ediliyordu; doğrusu 0.5 × 0.533 ≈ 0.267R.
+            # Yani küçük riskli kazançlar bütçeyi gereğinden fazla açıyordu.
             if RISK_BUDGET_REFUND and realized_r > 0:
-                cap = allocated if allocated and allocated > 0 else 1.0
-                refund = min(realized_r, cap)
+                weight = allocated if allocated and allocated > 0 else 1.0
+                refund = min(realized_r * weight, weight)
                 self.daily_risk_used_r = max(0.0, self.daily_risk_used_r - refund)
 
     # ── Sorgular ──────────────────────────────────────────────────────────────
