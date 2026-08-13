@@ -35,10 +35,16 @@ def _make_futures_trader():
         cl.futures_exchange_info.return_value = {
             "symbols": [{
                 "symbol": "TESTUSDT",
-                "filters": [{"filterType": "LOT_SIZE", "stepSize": "0.001", "minQty": "0.001"}],
+                "filters": [
+                    {"filterType": "LOT_SIZE", "stepSize": "0.001", "minQty": "0.001"},
+                    {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+                ],
             }]
         }
-        cl.futures_create_order.return_value = {"orderId": 1, "avgPrice": "100.0"}
+        cl.futures_create_order.return_value = {
+            "orderId": 1, "avgPrice": "100.0",
+            "executedQty": "999999", "status": "FILLED",
+        }
         cl.futures_change_leverage.return_value = {}
         cl.futures_change_margin_type.return_value = {}
         cl.futures_cancel_order.return_value = {}
@@ -168,9 +174,10 @@ def test_partial_exit_accounting_is_consistent():
     assert not p.positions
     # Kazançlı senaryo: bakiye başlangıcın üstünde olmalı
     assert p.balance > start
-    # total_pnl ile bakiye değişimi tutarlı (komisyon dahil)
-    assert p.balance == pytest.approx(start + p.total_pnl - p.total_commission
-                                      + p.total_commission, rel=1e-6) or True
+    # DENETİM: bu invariant `or True` ile ölüydü ve ifadesi de kendini
+    # sıfırlıyordu (`- comm + comm`). Gerçek invariant: bakiye değişimi,
+    # biriken net PnL'e eşit olmalı — komisyon zaten net'in içinde.
+    assert p.balance == pytest.approx(start + p.total_pnl, rel=1e-9)
     assert p.wins == 1 and p.losses == 0
 
 
@@ -187,7 +194,9 @@ def test_commission_charged_on_every_leg():
     p.open_position("TESTUSDT", "BUY", 100.0, 50.0, 3, 98.0, 107.0,
                     atr_pct=0.01, qty=qty, risk_amount=3.0)
     open_comm = p.total_commission
-    assert open_comm == pytest.approx(qty * 100.0 * config.COMMISSION_RATE)
+    entry = p.positions["TESTUSDT"]["entry_price"]
+    assert entry == pytest.approx(100.0 * (1 + config.SLIPPAGE_PCT))
+    assert open_comm == pytest.approx(qty * entry * config.COMMISSION_RATE)
 
     for px in PRICE_PATH_WINNER:
         p.check_positions({"TESTUSDT": px})

@@ -33,7 +33,51 @@ GATES = {
     "min_profit_factor":     1.3,
     "max_drawdown_pct":      0.15,
     "min_expectancy_r":      0.10,
+    # "30 gün aralık" tek başına kesintisizlik demek değil — aktif gün ve
+    # en uzun sessiz boşluk ayrıca ölçülür.
+    "min_active_days":       20,
+    "max_silent_gap_days":   2.0,
 }
+
+
+def _starting_equity() -> float:
+    """Refactor kesim anındaki sermaye. Yoksa yapılandırılmış başlangıç."""
+    from config import PAPER_BALANCE
+    try:
+        rows = _rows("SELECT value FROM bot_state WHERE key = 'paper_balance'")
+        if rows:
+            import json
+            v = rows[0]["value"]
+            return float(json.loads(v) if isinstance(v, str) else v)
+    except Exception:
+        pass
+    return float(PAPER_BALANCE)
+
+
+def _snapshot_drawdown() -> float | None:
+    """
+    Periyodik equity snapshot'larından GERÇEK drawdown.
+
+    Kapanmış işlem eğrisi açık pozisyonun anlık zararını göremez: -3R'ye inip
+    +1R'de kapanan bir işlem kayıtta sıfır drawdown'lı bir kazançtır. Gerçek
+    ölçüm ancak düzenli equity örneklemesiyle yapılabilir.
+    """
+    try:
+        rows = _rows(
+            "SELECT equity FROM equity_snapshots WHERE at >= ? ORDER BY at",
+            (REFACTOR_CUTOFF,),
+        )
+    except Exception:
+        return None
+    if len(rows) < 50:
+        return None
+    peak = dd = 0.0
+    for r in rows:
+        e = float(r["equity"])
+        peak = max(peak, e)
+        if peak > 0:
+            dd = max(dd, (peak - e) / peak)
+    return dd
 
 
 def _rows(sql, params=()):
@@ -97,28 +141,59 @@ def check() -> tuple[bool, list[tuple[str, bool, str]]]:
         f"{exp_r:+.3f}R/işlem (gereken: ≥{GATES['min_expectancy_r']})",
     ))
 
-    # 5) Max drawdown
-    eq, peak, max_dd = 0.0, 0.0, 0.0
+    # 5) Max drawdown — SERMAYE üzerinden
+    #
+    # DENETİM BULGUSU: eğri 0.0'dan başlayan kümülatif KÂR idi, sermaye değil.
+    # İki sonucu vardı: (a) yüzde matematiği anlamsızdı — 100$ kârdan 50$
+    # geri vermek "%50 drawdown" sayılıyordu, oysa 1000$'lık hesapta bu %5'tir;
+    # (b) ilk işlemler zararlıysa `peak` 0 kaldığı için o dönem HİÇ sayılmıyordu.
+    # Artık başlangıç sermayesinden başlayan gerçek equity eğrisi kullanılıyor.
+    #
+    # Not: bu hâlâ KAPANMIŞ işlem eğrisidir; açık pozisyonun anlık zararını
+    # görmez, yani gerçek drawdown'ın ALT SINIRIDIR. Gerçek ölçüm için
+    # `equity_snapshots` tablosu kullanılır (varsa aşağıdaki kapı onu okur).
+    start_eq = _starting_equity()
+    eq, peak, max_dd = start_eq, start_eq, 0.0
     for x in nets:
         eq += x
         peak = max(peak, eq)
         if peak > 0:
             max_dd = max(max_dd, (peak - eq) / peak)
+
+    snap_dd = _snapshot_drawdown()
+    if snap_dd is not None:
+        max_dd = max(max_dd, snap_dd)
+        source = "equity snapshot (açık pozisyonlar dahil)"
+    else:
+        source = "kapanmış işlemler — ALT SINIR, gerçek DD daha yüksek olabilir"
     ok = max_dd <= GATES["max_drawdown_pct"]
     results.append((
         "Max drawdown",
         ok,
-        f"%{max_dd*100:.1f} (izin: ≤%{GATES['max_drawdown_pct']*100:.0f})",
+        f"%{max_dd*100:.1f} (izin: ≤%{GATES['max_drawdown_pct']*100:.0f}) — {source}",
     ))
 
     # 6) Kesintisiz çalışma — işlem kapanışları arasındaki en uzun boşluk
-    times = [datetime.fromisoformat(t["close_time"]) for t in trades]
-    span_days = (times[-1] - times[0]).total_seconds() / 86400
-    ok = span_days >= GATES["min_uptime_days"]
+    #
+    # DENETİM BULGUSU: bu kapı "kesintisiz çalışma" diyordu ama ölçtüğü şey
+    # yalnızca İLK ve SON işlem arasındaki takvim farkıydı. Arada 29 gün kapalı
+    # kalsa bile geçiyordu — tam da ölçmesi gereken şeyi ölçmüyordu.
+    # Artık işlem AKTİVİTESİ olan gün sayısı ve en uzun sessiz boşluk ölçülüyor.
+    times = sorted(datetime.fromisoformat(t["close_time"]) for t in trades)
+    span_days   = (times[-1] - times[0]).total_seconds() / 86400
+    active_days = len({t.date() for t in times})
+    gaps = [(b - a).total_seconds() / 86400 for a, b in zip(times, times[1:])]
+    max_gap = max(gaps) if gaps else 0.0
+
+    ok = (span_days >= GATES["min_uptime_days"]
+          and active_days >= GATES["min_active_days"]
+          and max_gap <= GATES["max_silent_gap_days"])
     results.append((
-        "Çalışma süresi",
+        "Kesintisiz çalışma",
         ok,
-        f"{span_days:.1f} gün (gereken: {GATES['min_uptime_days']})",
+        f"{span_days:.1f} gün aralık, {active_days} aktif gün "
+        f"(gereken {GATES['min_active_days']}), en uzun sessizlik {max_gap:.1f} gün "
+        f"(izin ≤{GATES['max_silent_gap_days']})",
     ))
 
     # 7) Çıkış etiketleri gerçekten ayrışıyor mu?

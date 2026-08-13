@@ -128,7 +128,8 @@ def test_open_positions_survive_restart():
     n = p2.restore_positions(load_open_positions())
     assert n == 1
     r = p2.positions["TESTUSDT"]
-    assert r["entry_price"] == 100.0
+    # Giriş ALEYHTE kayar — kâğıt da canlıyla aynı maliyet modelini uygular.
+    assert r["entry_price"] == pytest.approx(100.0 * (1 + config.SLIPPAGE_PCT))
     assert r["strategy"] == "MOMENTUM_FAST"
     assert r["risk_amount"] == pytest.approx(7.5)
     assert isinstance(r["open_time"], datetime), "datetime tipi korunmalı"
@@ -145,7 +146,8 @@ def test_restored_position_still_evaluates_correctly():
     p2 = PaperPortfolio(1000.0)
     p2.restore_positions(load_open_positions())
     pos = p2.positions["TESTUSDT"]
-    acts = evaluate(pos, 102.0)     # +1R
+    # 1R, GERÇEKLEŞEN girişe göre ölçülür (kayma dahil) — 100.0'a göre değil.
+    acts = evaluate(pos, pos["entry_price"] + pos["risk_per_unit"])
     assert any(a["reason"] == EXIT_TP1 for a in acts)
 
 

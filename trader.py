@@ -21,8 +21,9 @@ from binance.client import Client
 from binance.exceptions import BinanceAPIException
 
 from config import (
-    API_KEY, API_SECRET, PAPER_TRADING, PAPER_BALANCE, SPOT_MODE,
-    COMMISSION_RATE,
+    API_KEY, API_SECRET, TESTNET, PAPER_TRADING, PAPER_BALANCE, SPOT_MODE,
+    COMMISSION_RATE, SLIPPAGE_PCT, SLIPPAGE_STOP_MULT, FUNDING_RATE_8H,
+    MARGIN_MODE,
 )
 from position import (
     new_position, evaluate, position_summary, realized_r,
@@ -40,6 +41,68 @@ def _round_step(qty: float, step: float) -> float:
         return qty
     precision = int(round(-math.log10(step)))
     return round(math.floor(qty / step) * step, precision)
+
+
+def _round_tick(price: float, tick: float, side_up: bool) -> float:
+    """
+    Fiyatı sembolün tickSize'ına oturt.
+
+    DENETİM BULGUSU: stop fiyatı `round(price, 6)` ile gönderiliyordu. Binance
+    PRICE_FILTER'a uymayan fiyatı -1111 ile REDDEDER; bu da aşağıdaki
+    `_sync_protective_stop` hatasını tetikleyip pozisyonu korumasız bırakıyordu.
+
+    Yuvarlama yönü önemli: SHORT'un stop'u yukarıda, LONG'unki aşağıda. Her
+    zaman fiyattan UZAĞA yuvarlanır. Fiyata doğru yuvarlamak stop'u bir tick
+    daraltır (kazancı ihmal edilebilir) ama emrin "hemen tetiklenir" (-2021)
+    hatasıyla reddedilme ihtimalini artırır — o hata pozisyonu korumasız
+    bırakıyor, yani ihmal edilebilir bir kazanç için ciddi bir risk.
+    """
+    if tick <= 0:
+        return round(price, 6)
+    precision = max(0, int(round(-math.log10(tick))))
+    n = price / tick
+    n = math.ceil(n) if side_up else math.floor(n)
+    return round(n * tick, precision)
+
+
+def fill_price(price: float, side: str, is_entry: bool, reason: str = "") -> float:
+    """
+    Gerçekleşme fiyatı — her zaman ALEYHTE kayar.
+
+    DENETİM BULGUSU: `PaperPortfolio` emirleri tam görülen fiyattan dolduruyordu;
+    `backtest.py` ise her bacakta kayma uyguluyordu. İkisi aynı stratejiyi farklı
+    maliyetle ölçüyordu ve `go_live_check` kapıları kâğıt tarafından besleniyordu
+    — yani gerçek paraya geçiş eşiği olduğundan kolaydı.
+
+    Stop çıkışları ayrıca cezalandırılır: stop emri piyasa emridir ve tam da
+    hareketin sert olduğu anda tetiklenir, normal emirden kötü dolar.
+    """
+    slip = SLIPPAGE_PCT
+    if not is_entry and "STOP" in (reason or ""):
+        slip *= SLIPPAGE_STOP_MULT
+    # Giriş: BUY yukarı, SELL aşağı kayar. Çıkış: tersi.
+    if is_entry:
+        adverse_up = side == "BUY"
+    else:
+        adverse_up = side != "BUY"
+    return price * (1 + slip) if adverse_up else price * (1 - slip)
+
+
+def funding_cost(pos: dict, price: float, now: datetime | None = None) -> float:
+    """
+    Perpetual funding — 8 saatte bir notional üzerinden.
+
+    Kısa pozisyonlarda küçük, ama time-stop 480 dakikaya kadar izin verdiği için
+    sıfır değil. Modellenmezse kâğıt sonucu yine iyimser çıkar.
+    """
+    now = now or datetime.now()
+    hours = (now - pos["open_time"]).total_seconds() / 3600
+    periods = int(hours // 8)
+    charged = pos.get("_funding_periods", 0)
+    if periods <= charged:
+        return 0.0
+    pos["_funding_periods"] = periods
+    return pos["qty"] * price * FUNDING_RATE_8H * (periods - charged)
 
 
 # ── Ortak çıkış yürütücüsü ────────────────────────────────────────────────────
@@ -86,6 +149,10 @@ class ExitEngineMixin:
         self._persist_positions()
         return closed
 
+    # Kâğıt tarafı gerçekleşmeyi simüle eder (kayma uygular); gerçek trader'da
+    # fiyat borsadan gelir, sentetik kayma eklemek çift sayım olur.
+    SIMULATE_FILLS = False
+
     def _apply_partial(self, pos, fraction, price, reason):
         """Pozisyonun bir kısmını realize et; kalan koşmaya devam eder."""
         qty_close = pos["initial_qty"] * fraction
@@ -95,6 +162,8 @@ class ExitEngineMixin:
         ok = self._do_partial(pos, qty_close, price)
         if not ok:
             return
+        if self.SIMULATE_FILLS:
+            price = fill_price(price, pos["side"], is_entry=False, reason=reason)
 
         gross = ((price - pos["entry_price"]) if pos["side"] == "BUY"
                  else (pos["entry_price"] - price)) * qty_close
@@ -154,6 +223,8 @@ class ExitEngineMixin:
 
 class PaperPortfolio(ExitEngineMixin):
 
+    SIMULATE_FILLS = True
+
     def __init__(self, initial_balance: float):
         self.balance   = initial_balance
         self.positions = {}
@@ -169,6 +240,8 @@ class PaperPortfolio(ExitEngineMixin):
                       entry_snapshot=None):
         if symbol in self.positions:
             return False, "Zaten açık"
+        # Kâğıt da olsa emir aleyhte dolar — canlıyla aynı maliyet modeli.
+        price = fill_price(price, side, is_entry=True)
         if qty is None:
             qty = (margin * leverage) / price
         notional = qty * price
@@ -204,19 +277,29 @@ class PaperPortfolio(ExitEngineMixin):
             return False, "Yok"
         pos = self.positions.pop(symbol)
         qty = pos["qty"]
+        price = fill_price(price, pos["side"], is_entry=False, reason=reason)
 
         gross = ((price - pos["entry_price"]) if pos["side"] == "BUY"
                  else (pos["entry_price"] - price)) * qty
         comm  = qty * price * COMMISSION_RATE
-        net   = gross - comm
+        fund  = funding_cost(pos, price) + pos.get("_funding_paid", 0.0)
+        net   = gross - comm - fund
 
         self.balance += pos["margin"] + net
-        self.total_pnl += net
         self.total_commission += comm
 
-        total_net   = net + pos.get("realized_pnl", 0.0)
-        total_comm  = comm + pos.get("realized_commission", 0.0) + pos.get("open_commission", 0.0)
-        total_gross = total_net + total_comm
+        # DENETİM BULGUSU: açılış komisyonu bakiyeden düşülüyordu ama işlemin
+        # net_pnl'ine GİRMİYORDU. Yani DB'ye, R-katsayısına, kill switch'e ve
+        # go-live kapılarına giden sayı her işlemde bir bacak komisyon kadar
+        # iyimserdi. Artık tam maliyet net'e dahil.
+        open_comm   = pos.get("open_commission", 0.0)
+        total_comm  = comm + pos.get("realized_commission", 0.0) + open_comm
+        total_net   = net + pos.get("realized_pnl", 0.0) - open_comm
+        total_gross = total_net + total_comm + fund
+        # `total_pnl` gerçekleşen TAM kâr olmalı: açılış komisyonu bakiyeden
+        # düşülüyordu ama buraya girmiyordu, yani bakiye ile toplam PnL
+        # her işlemde bir bacak komisyon kadar ayrışıyordu.
+        self.total_pnl += net - open_comm
 
         if total_net >= 0: self.wins += 1
         else:              self.losses += 1
@@ -279,7 +362,7 @@ class PaperPortfolio(ExitEngineMixin):
 class SpotTrader(ExitEngineMixin):
 
     def __init__(self):
-        self.client    = Client(API_KEY, API_SECRET)
+        self.client    = Client(API_KEY, API_SECRET, testnet=TESTNET)
         self.positions = {}
         self.trade_log = []
         self.total_pnl = 0.0
@@ -417,7 +500,7 @@ class FuturesTrader(ExitEngineMixin):
     STOP_UPDATE_THRESHOLD = 0.001
 
     def __init__(self):
-        self.client    = Client(API_KEY, API_SECRET)
+        self.client    = Client(API_KEY, API_SECRET, testnet=TESTNET)
         self.positions = {}
         self.trade_log = []
         self.total_pnl = 0.0
@@ -425,6 +508,12 @@ class FuturesTrader(ExitEngineMixin):
         self.wins = self.losses = 0
         self.balance = 0.0
         self._step_cache: dict[str, tuple[float, float]] = {}
+        self._tick_cache: dict[str, float] = {}
+        # Borsada koruyucu stop'u OLMADIĞI bilinen pozisyonlar: symbol -> sebep.
+        # main.py bunu okuyup alarm üretir ve yeni işlem açmayı durdurur.
+        self.unprotected: dict[str, str] = {}
+        # Binance'de açık ama yerel kaydı olmayan pozisyonlar.
+        self.orphans: dict[str, str] = {}
         self._load_step_cache()
 
     def _load_step_cache(self):
@@ -434,10 +523,19 @@ class FuturesTrader(ExitEngineMixin):
                 for f in s["filters"]:
                     if f["filterType"] == "LOT_SIZE":
                         self._step_cache[s["symbol"]] = (float(f["stepSize"]), float(f["minQty"]))
-                        break
-            logger.info(f"Step cache yüklendi: {len(self._step_cache)} sembol")
+                    elif f["filterType"] == "PRICE_FILTER":
+                        self._tick_cache[s["symbol"]] = float(f["tickSize"])
+            logger.info(
+                f"Filtre cache yüklendi: {len(self._step_cache)} lot, "
+                f"{len(self._tick_cache)} tick"
+            )
         except Exception as e:
-            logger.error(f"Step cache yüklenemedi: {e}")
+            logger.error(f"Filtre cache yüklenemedi: {e}")
+
+    def _get_tick(self, symbol: str) -> float:
+        if symbol not in self._tick_cache:
+            self._load_step_cache()
+        return self._tick_cache.get(symbol, 0.0)
 
     def sync_balance(self):
         try:
@@ -464,9 +562,44 @@ class FuturesTrader(ExitEngineMixin):
             logger.error(f"Transfer hatası: {e}")
             return False
 
+    def _client_order_id(self, symbol: str) -> str:
+        """
+        Benzersiz emir kimliği — idempotency'nin temeli.
+
+        Timeout aldığımızda emrin gidip gitmediğini bilemeyiz. Aynı emri
+        körlemesine tekrar göndermek çift pozisyon açar. Bu kimlikle borsaya
+        "şu emri gönderdim mi?" diye sorabiliyoruz.
+        """
+        self._order_seq = getattr(self, "_order_seq", 0) + 1
+        stamp = int(datetime.now().timestamp() * 1000)
+        return f"cb{stamp}{self._order_seq:03d}"[:36]
+
+    def _recover_order(self, symbol: str, coid: str):
+        """Timeout/hata sonrası emrin gerçek akıbetini borsadan öğren."""
+        try:
+            return self.client.futures_get_order(symbol=symbol, origClientOrderId=coid)
+        except BinanceAPIException as e:
+            if getattr(e, "code", None) == -2013:     # emir hiç oluşmamış
+                return None
+            logger.warning(f"Emir sorgulanamadı {symbol} ({coid}): {e}")
+            return None
+        except Exception as e:
+            logger.warning(f"Emir sorgulanamadı {symbol} ({coid}): {e}")
+            return None
+
+    @staticmethod
+    def _fill_of(order) -> tuple[float, float]:
+        """(gerçekleşen miktar, ortalama fiyat) — ACK cevabında ikisi de 0'dır."""
+        if not order:
+            return 0.0, 0.0
+        try:
+            return float(order.get("executedQty") or 0.0), float(order.get("avgPrice") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0, 0.0
+
     def _set_leverage(self, symbol: str, leverage: int) -> bool:
         try:
-            self.client.futures_change_margin_type(symbol=symbol, marginType="ISOLATED")
+            self.client.futures_change_margin_type(symbol=symbol, marginType=MARGIN_MODE)
         except BinanceAPIException:
             pass
         try:
@@ -499,10 +632,40 @@ class FuturesTrader(ExitEngineMixin):
             if q < min_q:
                 return False, f"Miktar küçük: {q} < {min_q}"
 
-            order = self.client.futures_create_order(
-                symbol=symbol, side=side, type="MARKET", quantity=q,
-            )
-            ap = float(order.get("avgPrice") or price)
+            # DENETİM BULGUSU: emrin varsayılan cevabı ACK'tir — "alındı",
+            # "gerçekleşti" değil. Eski kod `avgPrice`'ı doğrudan okuyup
+            # gerçekleşmiş sayıyordu; ACK'te o alan 0 gelir ve pozisyon
+            # sinyaldeki fiyattan açılmış gibi kaydediliyordu. Timeout/5xx
+            # durumunda ise emrin akıbeti hiç bilinmiyordu.
+            #
+            # Artık: benzersiz clientOrderId + RESULT cevabı + doğrulama.
+            # clientOrderId sayesinde timeout sonrası emir KÖRLEMESİNE
+            # tekrarlanmıyor, borsadan sorgulanıyor.
+            coid = self._client_order_id(symbol)
+            try:
+                order = self.client.futures_create_order(
+                    symbol=symbol, side=side, type="MARKET", quantity=q,
+                    newClientOrderId=coid, newOrderRespType="RESULT",
+                )
+            except Exception as e:
+                order = self._recover_order(symbol, coid)
+                if order is None:
+                    logger.error(f"Emir durumu bilinmiyor {symbol} ({coid}): {e}")
+                    return False, f"Emir durumu doğrulanamadı: {e}"
+
+            filled, ap = self._fill_of(order)
+            if filled <= 0:
+                order = self._recover_order(symbol, coid) or order
+                filled, ap = self._fill_of(order)
+            if filled <= 0:
+                logger.error(f"Emir gerçekleşmedi {symbol} ({coid})")
+                return False, "Emir gerçekleşmedi"
+            if ap <= 0:
+                ap = price
+            # Kısmi dolum: gerçekten dolan miktarla devam et, hayali miktarla değil.
+            if abs(filled - q) / max(q, 1e-9) > 0.001:
+                logger.warning(f"{symbol}: kısmi dolum {filled}/{q} — gerçek miktar esas alındı")
+            q = filled
 
             # Koruyucu stop — bot çökerse pozisyon korumasız kalmasın.
             # Bot yaşadığı sürece stop'u kendisi yönetir ve bu emri günceller.
@@ -514,7 +677,7 @@ class FuturesTrader(ExitEngineMixin):
                         symbol=symbol, side=sl_side, type="MARKET",
                         quantity=q, reduceOnly=True,
                     )
-                except BinanceAPIException as ce:
+                except Exception as ce:
                     logger.error(f"Acil kapama da başarısız {symbol}: {ce}")
                 return False, "SL kurulamadı, pozisyon koruma amaçlı kapatıldı"
 
@@ -549,38 +712,132 @@ class FuturesTrader(ExitEngineMixin):
             ))
             self._persist_positions()
             return True, "OK"
-        except BinanceAPIException as e:
-            logger.error(f"Futures açma hatası {symbol}: {e}")
+        except Exception as e:
+            logger.error(f"Futures açma hatası {symbol}: {type(e).__name__}: {e}")
             return False, str(e)
 
     def _place_stop(self, symbol, sl_side, stop_price):
+        """
+        Borsaya koruyucu STOP_MARKET koy. Başarısızsa None döner — çağıran taraf
+        bu ayrımı MUTLAKA dikkate almalı.
+        """
+        tick = self._get_tick(symbol)
+        # sl_side "SELL" ise pozisyon LONG, stop fiyatın altında → aşağı yuvarla.
+        px = _round_tick(stop_price, tick, side_up=(sl_side == "BUY"))
         try:
             o = self.client.futures_create_order(
                 symbol=symbol, side=sl_side, type="STOP_MARKET",
-                stopPrice=round(stop_price, 6), closePosition=True,
+                stopPrice=px, closePosition=True,
             )
             return o.get("orderId")
-        except BinanceAPIException as e:
-            logger.error(f"SL order başarısız {symbol}: {e}")
+        except Exception as e:
+            # Yalnız BinanceAPIException yakalamak yetmez: timeout/bağlantı
+            # hatası da stop kurulamaması demektir ve aynı şekilde ele alınmalı.
+            logger.error(f"SL order başarısız {symbol} @ {px}: {type(e).__name__}: {e}")
             return None
 
+    def _cancel_stop(self, symbol, order_id) -> bool:
+        if not order_id:
+            return True
+        try:
+            self.client.futures_cancel_order(symbol=symbol, orderId=order_id)
+            return True
+        except Exception as e:
+            # -2011: emir zaten yok (tetiklenmiş veya iptal edilmiş) — sorun değil.
+            if getattr(e, "code", None) == -2011:
+                return True
+            logger.warning(f"Eski stop iptal edilemedi {symbol}#{order_id}: {e}")
+            return False
+
     def _sync_protective_stop(self, pos):
-        """Bot stop'u taşıdığında borsadaki koruyucu emri de taşı."""
+        """
+        Bot stop'u taşıdığında borsadaki koruyucu emri de taşı.
+
+        DENETİM BULGUSU (kritik): eski kod önce eski emri İPTAL EDİYOR, sonra
+        yenisini kurmaya çalışıyordu. Yeni emir reddedilirse pozisyon tamamen
+        korumasız kalıyor, üstelik `_exchange_stop` yine de yeni değere
+        yazıldığı için bir sonraki tick eşiği geçemeyip TEKRAR DENEMİYORDU.
+        Yani koruma sessizce ve kalıcı olarak kayboluyordu.
+
+        Yeni sıra: ÖNCE yeni emri kur, BAŞARILIYSA eskisini iptal et. Böylece
+        hiçbir an koruma boşluğu oluşmuyor. Yeni emir kurulamazsa eski stop
+        yerinde kalır — daha geniş ama geçerli bir koruma.
+        """
         symbol = pos["symbol"]
         new_stop = pos["stop_loss"]
         last = pos.get("_exchange_stop", pos.get("initial_stop"))
         if last and abs(new_stop - last) / max(last, 1e-9) < self.STOP_UPDATE_THRESHOLD:
             return
-        old_id = pos.get("stop_order_id")
-        if old_id:
-            try:
-                self.client.futures_cancel_order(symbol=symbol, orderId=old_id)
-            except BinanceAPIException:
-                pass
+
         sl_side = "SELL" if pos["side"] == "BUY" else "BUY"
+        old_id = pos.get("stop_order_id")
+
         new_id = self._place_stop(symbol, sl_side, new_stop)
-        pos["stop_order_id"] = new_id
-        pos["_exchange_stop"] = new_stop
+        if new_id is not None:
+            self._cancel_stop(symbol, old_id)
+            pos["stop_order_id"] = new_id
+            pos["_exchange_stop"] = new_stop
+            self.unprotected.pop(symbol, None)
+            return
+
+        # Yeni emir kurulamadı. Eskisi hâlâ duruyorsa pozisyon korumalı —
+        # `_exchange_stop`'a DOKUNMUYORUZ ki bir sonraki tick yeniden denesin.
+        if old_id and self._verify_stop_exists(symbol, old_id):
+            logger.warning(
+                f"{symbol}: stop güncellenemedi, eski koruma ({last}) yerinde. "
+                f"Sonraki tick'te tekrar denenecek."
+            )
+            return
+
+        # Ne yeni ne eski koruma var. Bu, pozisyonun gerçekten korumasız olduğu
+        # tek durum — sessizce geçilemez.
+        self._mark_unprotected(pos, "stop güncellenemedi ve eski emir de yok")
+
+    def _verify_stop_exists(self, symbol, order_id) -> bool:
+        try:
+            o = self.client.futures_get_order(symbol=symbol, orderId=order_id)
+            return o.get("status") in ("NEW", "PARTIALLY_FILLED")
+        except Exception as e:
+            logger.warning(f"Stop durumu okunamadı {symbol}#{order_id}: {e}")
+            return False
+
+    def _mark_unprotected(self, pos, reason: str):
+        """
+        Korumasız pozisyonu kaydet ve acil kapamayı dene.
+
+        Korumasız açık pozisyon, botun girebileceği en kötü durum: kaldıraçlı ve
+        stop'suz. Kapatma da başarısız olursa pozisyon `unprotected` içinde kalır
+        ve main.py yeni işlem açmayı durdurup alarm üretir.
+        """
+        symbol = pos["symbol"]
+        self.unprotected[symbol] = reason
+        logger.error(f"KORUMASIZ POZİSYON {symbol}: {reason} — acil kapama deneniyor")
+        try:
+            step, _ = self._get_step(symbol)
+            close_side = "SELL" if pos["side"] == "BUY" else "BUY"
+            self.client.futures_create_order(
+                symbol=symbol, side=close_side, type="MARKET",
+                quantity=_round_step(pos["qty"], step), reduceOnly=True,
+            )
+        except BinanceAPIException as e:
+            logger.error(f"Acil kapama başarısız {symbol}: {e}")
+            return
+        # Emir gönderildi diye kapandığını VARSAYMIYORUZ — borsadan doğrula.
+        if self._position_amount(symbol) == 0.0:
+            self.unprotected.pop(symbol, None)
+            self.positions.pop(symbol, None)
+            self._persist_positions()
+            logger.info(f"{symbol} korumasız kalınca kapatıldı ve doğrulandı")
+        else:
+            logger.error(f"{symbol} kapama emri gönderildi ama pozisyon hâlâ açık")
+
+    def _position_amount(self, symbol: str) -> float:
+        try:
+            raw = self.client.futures_position_information(symbol=symbol)
+            return sum(abs(float(p.get("positionAmt", 0))) for p in raw)
+        except Exception as e:
+            logger.warning(f"Pozisyon miktarı okunamadı {symbol}: {e}")
+            return float("nan")   # bilinmiyor — "kapandı" sayma
 
     def _do_partial(self, pos, qty_close, price) -> bool:
         symbol = pos["symbol"]
@@ -643,9 +900,16 @@ class FuturesTrader(ExitEngineMixin):
             self._persist_positions()
             return True, total_net
         except BinanceAPIException as e:
-            already_closed_codes = {-2022, -4061, -2011, -1111}
-            if hasattr(e, "code") and e.code in already_closed_codes:
-                logger.info(f"Pozisyon Binance'de zaten kapanmış ({symbol}), sync yapılıyor")
+            # DENETİM: burada -1111, -2022, -4061 ve -2011 "pozisyon zaten
+            # kapalı" sayılıyordu. HİÇBİRİ bunu kanıtlamaz:
+            #   -1111 fiyat/miktar biçimi   -2022 reduceOnly reddedildi
+            #   -4061 positionSide uyuşmadı -2011 iptal reddedildi
+            # Hepsi pozisyon AÇIKKEN de dönebilir. Kapanmış saymak, canlı bir
+            # pozisyonu yerel takipten düşürüp sahipsiz bırakıyordu.
+            # Tek geçerli kanıt borsadaki positionAmt == 0.
+            amt = self._position_amount(symbol)
+            if amt == 0.0:
+                logger.info(f"Pozisyon Binance'de kapalı doğrulandı ({symbol}), sync yapılıyor")
                 self.sync_balance()
                 self._persist_positions()
                 return True, 0.0
@@ -654,6 +918,95 @@ class FuturesTrader(ExitEngineMixin):
             return False, str(e)
 
     _record_trade = PaperPortfolio._record_trade
+
+    def restore_positions(self, saved: dict):
+        """
+        Restart sonrası pozisyonları geri yükle — ve BORSADAN DOĞRULA.
+
+        DENETİM BULGUSU: temel sınıf yalnızca veritabanını okuyordu. Bot kapalıyken
+        pozisyon kapanmış olabilir, kısmen kapanmış olabilir veya koruyucu stop
+        tetiklenip yok olmuş olabilir. Doğrulamadan devam etmek, botun var olmayan
+        bir pozisyonu yönetmesi ya da korumasız gerçek bir pozisyonu korumalı
+        sanması demek. `Restart=always` altında bu her çökmede tekrarlanır.
+        """
+        restored = super().restore_positions(saved)
+        if not self.positions:
+            self._detect_orphans()
+            return restored
+
+        try:
+            raw = self.client.futures_position_information()
+        except BinanceAPIException as e:
+            # Borsayı okuyamıyorsak hiçbir şeyi doğrulanmış sayamayız.
+            logger.error(f"Restart doğrulaması yapılamadı: {e} — tüm pozisyonlar şüpheli")
+            for sym in self.positions:
+                self.unprotected[sym] = "restart doğrulanamadı"
+            return restored
+
+        live = {
+            p["symbol"]: abs(float(p.get("positionAmt", 0)))
+            for p in raw if abs(float(p.get("positionAmt", 0))) > 0
+        }
+
+        for sym in list(self.positions):
+            pos = self.positions[sym]
+            if sym not in live:
+                logger.info(f"RESTART: {sym} bot kapalıyken kapanmış, kayıttan düşürüldü")
+                self.positions.pop(sym)
+                continue
+
+            # Miktar değişmişse (kısmi çıkış veya elle müdahale) borsayı esas al.
+            if abs(live[sym] - pos["qty"]) / max(pos["qty"], 1e-9) > 0.01:
+                logger.warning(
+                    f"RESTART: {sym} miktar uyuşmuyor — kayıt {pos['qty']}, "
+                    f"borsa {live[sym]}. Borsa esas alındı."
+                )
+                pos["qty"] = live[sym]
+
+            # Koruyucu stop hâlâ duruyor mu?
+            if self._verify_stop_exists(sym, pos.get("stop_order_id")):
+                continue
+            logger.warning(f"RESTART: {sym} koruyucu stop'u yok, yeniden kuruluyor")
+            sl_side = "SELL" if pos["side"] == "BUY" else "BUY"
+            new_id = self._place_stop(sym, sl_side, pos["stop_loss"])
+            if new_id is not None:
+                pos["stop_order_id"] = new_id
+                pos["_exchange_stop"] = pos["stop_loss"]
+            else:
+                self._mark_unprotected(pos, "restart sonrası stop kurulamadı")
+
+        self._persist_positions()
+        self._detect_orphans(live)
+        return len(self.positions)
+
+    def _detect_orphans(self, live: dict | None = None):
+        """
+        Binance'de açık olup yerel kaydı olmayan pozisyonları yakala.
+
+        DENETİM BULGUSU: `sync_positions` yalnız tek yöne bakıyordu (yerelde olup
+        borsada olmayan). Ters yön hiç yönetilmiyordu. Bu, `open_position`
+        piyasa emrini gönderdikten sonra ama `_persist_positions()` çalışmadan
+        önce süreç ölürse gerçekleşir: pozisyon borsada açık, bot habersiz.
+        """
+        if live is None:
+            try:
+                raw = self.client.futures_position_information()
+                live = {
+                    p["symbol"]: abs(float(p.get("positionAmt", 0)))
+                    for p in raw if abs(float(p.get("positionAmt", 0))) > 0
+                }
+            except BinanceAPIException as e:
+                logger.warning(f"Sahipsiz pozisyon taraması yapılamadı: {e}")
+                return
+
+        for sym in live:
+            if sym in self.positions:
+                self.orphans.pop(sym, None)
+                continue
+            if sym in self.orphans:
+                continue
+            self.orphans[sym] = f"borsada {live[sym]} açık, yerel kaydı yok"
+            logger.error(f"SAHİPSİZ POZİSYON {sym}: {self.orphans[sym]}")
 
     def sync_positions(self) -> set[str]:
         """
@@ -705,6 +1058,7 @@ class FuturesTrader(ExitEngineMixin):
             if binance_open != set(self.positions):
                 self.sync_balance()
 
+            self._detect_orphans({s: 1.0 for s in binance_open})
             self._persist_positions()
             return binance_open
         except BinanceAPIException as e:

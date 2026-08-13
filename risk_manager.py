@@ -105,7 +105,7 @@ class KillSwitchTracker:
             self.momentum_risk_used_r += risk_r
 
     def record_trade_close(self, pnl: float, balance: float, realized_r: float = 0.0,
-                           symbol: str | None = None):
+                           symbol: str | None = None, allocated: float = 1.0):
         self._reset_if_needed(balance)
         self.daily_pnl  += pnl
         self.weekly_pnl += pnl
@@ -124,8 +124,12 @@ class KillSwitchTracker:
             # Kârlı işlem risk bütçesini geri besler — ama kendi riskinden
             # fazlasını değil. Böylece iyi giden günde bot daha çok işlem
             # yapabilir, ama tek bir büyük kazanç bütçeyi sınırsız açamaz.
+            # İade, o işleme AYRILAN R ile sınırlı — sabit 1.0 değil. Yarım
+            # riskle açılmış bir işlem bütçeye tam 1R geri veremez, aksi hâlde
+            # bütçe küçük risklerle sonsuza kadar şişer.
             if RISK_BUDGET_REFUND and realized_r > 0:
-                refund = min(realized_r, 1.0)
+                cap = allocated if allocated and allocated > 0 else 1.0
+                refund = min(realized_r, cap)
                 self.daily_risk_used_r = max(0.0, self.daily_risk_used_r - refund)
 
     # ── Sorgular ──────────────────────────────────────────────────────────────
@@ -375,14 +379,41 @@ def portfolio_open_risk_r(positions: dict) -> float:
     return round(total, 3)
 
 
-def can_add_position(positions: dict, equity: float) -> tuple[bool, str]:
-    """Portföy seviyesi kontroller."""
+def can_add_position(positions: dict, equity: float,
+                     new_risk_r: float = 0.0) -> tuple[bool, str]:
+    """
+    Portföy seviyesi kontroller — PROSPEKTİF.
+
+    DENETİM BULGUSU: yalnız MEVCUT risk kontrol ediliyordu. 3.5R açıkken 1R'lik
+    yeni bir pozisyon kabul ediliyor ve toplam 4.5R'ye çıkıyordu — yani "max 4R"
+    tavanı aşılabiliyordu. Artık açılacak pozisyonun riski de hesaba katılıyor.
+    """
     if len(positions) >= MAX_OPEN_POSITIONS:
         return False, f"Max pozisyon ({MAX_OPEN_POSITIONS})"
     open_risk = portfolio_open_risk_r(positions)
     if open_risk >= MAX_PORTFOLIO_RISK_R:
         return False, f"Portföy risk tavanı ({open_risk:.1f}R/{MAX_PORTFOLIO_RISK_R:.1f}R)"
+    projected = open_risk + max(0.0, new_risk_r)
+    if projected > MAX_PORTFOLIO_RISK_R:
+        return False, (
+            f"Portföy risk tavanı ({open_risk:.1f}R + {new_risk_r:.1f}R "
+            f"= {projected:.1f}R > {MAX_PORTFOLIO_RISK_R:.1f}R)"
+        )
     return True, ""
+
+
+def allocated_r(risk_pct: float) -> float:
+    """
+    Bir işlemin günlük bütçeden tüketeceği R miktarı.
+
+    DENETİM BULGUSU: her işlem sabit 1.0R sayılıyordu. Ama gerçek risk
+    `dynamic_risk_pct()` ile %0.4–%1.2 arasında değişiyor — 3 kat fark. Sonuç:
+    "risk bütçesi" fiilen bir İŞLEM SAYACI gibi davranıyordu, yani refactor'ın
+    kaldırdığı sabit-sayı limitinin ta kendisi. Artık bütçe gerçek riski ölçüyor.
+    """
+    if RISK_PER_TRADE_PCT <= 0:
+        return 1.0
+    return round(risk_pct / RISK_PER_TRADE_PCT, 4)
 
 
 # ── Likidasyon güvenliği ──────────────────────────────────────────────────────

@@ -111,6 +111,17 @@ CREATE TABLE IF NOT EXISTS momentum_shadow (
 );
 
 -- Büyük hareket takibi (Big Move Capture KPI'ı için).
+CREATE TABLE IF NOT EXISTS equity_snapshots (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    at       TEXT NOT NULL,
+    equity   REAL NOT NULL,
+    balance  REAL,
+    open_positions INTEGER,
+    open_risk_r    REAL,
+    mode     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_equity_at ON equity_snapshots(at);
+
 CREATE TABLE IF NOT EXISTS big_moves (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol        TEXT,
@@ -570,3 +581,26 @@ def get_summary_excluding_top(n: int = 2) -> dict:
             }
     except Exception:
         return {}
+
+
+def save_equity_snapshot(equity: float, balance: float = 0.0,
+                         open_positions: int = 0, open_risk_r: float = 0.0,
+                         mode: str = "paper") -> None:
+    """
+    Periyodik equity örneği.
+
+    Gerçek maksimum drawdown yalnız kapanmış işlemlerden ÖLÇÜLEMEZ: -3R'ye
+    inip +1R'de kapanan bir işlem kayıtta sıfır drawdown'lı bir kazançtır.
+    Gerçek paraya geçiş kapısının anlamlı olması için düzenli örnekleme şart.
+    """
+    try:
+        with _conn() as con:
+            con.execute(
+                "INSERT INTO equity_snapshots "
+                "(at, equity, balance, open_positions, open_risk_r, mode) "
+                "VALUES (?,?,?,?,?,?)",
+                (datetime.now().isoformat(timespec="seconds"), float(equity),
+                 float(balance), int(open_positions), float(open_risk_r), mode),
+            )
+    except Exception as e:
+        logger.debug(f"Equity snapshot yazılamadı: {e}")

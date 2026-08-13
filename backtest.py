@@ -94,7 +94,19 @@ def _fetch_historical(client: Client, symbol: str, interval: str, days: int) -> 
 
 
 def _resample(df: pd.DataFrame, rule: str) -> pd.DataFrame:
-    return df.resample(rule).agg({
+    """
+    Üst timeframe'e topla — indeks mumun KAPANIŞ zamanı olur.
+
+    DENETİM BULGUSU (kritik look-ahead): pandas varsayılan olarak bucket'ı
+    BAŞLANGIÇ zamanıyla etiketler. Eski kod `df_15m.index <= ts` ile filtreliyordu;
+    yani ts=10:05'te "10:00" etiketli 15m mumu seçiliyordu — ama o mum 10:00–10:15
+    aralığını kapsar, yani 10:10'daki fiyatı İÇERİR. Backtest, henüz olmamış
+    fiyatlarla sinyal üretiyordu.
+
+    `label="right", closed="left"` ile indeks [T, T+R) aralığının kapanışı olur;
+    `index <= ts` artık "bu mum tamamen kapandı" anlamına gelir.
+    """
+    return df.resample(rule, label="right", closed="left").agg({
         "open": "first", "high": "max", "low": "min",
         "close": "last", "volume": "sum",
     }).dropna()
@@ -204,7 +216,11 @@ def run_backtest(
                         net = gross - comm
                         balance += pos["margin"] + net
 
-                        total_net  = net + pos["realized_pnl"] - pos.get("_funding_cost", 0.0)
+                        # DENETİM: açılış komisyonu net'e girmiyordu — her işlem
+                        # bir bacak komisyon kadar iyimser görünüyordu.
+                        total_net  = (net + pos["realized_pnl"]
+                                      - pos.get("_funding_cost", 0.0)
+                                      - pos.get("open_commission", 0.0))
                         total_comm = (comm + pos["realized_commission"]
                                       + pos.get("open_commission", 0.0))
                         trades.append({
@@ -233,7 +249,16 @@ def run_backtest(
                         break
                 if closed_this_bar:
                     break
-            equity_curve.append(balance + (pos["margin"] if pos else 0))
+            # DENETİM: eğri yalnız nakit + teminat idi; açık pozisyonun
+            # gerçekleşmemiş zararını görmüyordu. Bu, maksimum drawdown'ı
+            # sistematik olarak OLDUĞUNDAN KÜÇÜK gösteriyordu.
+            if pos:
+                unreal = ((float(candle["close"]) - pos["entry_price"])
+                          if pos["side"] == "BUY"
+                          else (pos["entry_price"] - float(candle["close"]))) * pos["qty"]
+                equity_curve.append(balance + pos["margin"] + unreal)
+            else:
+                equity_curve.append(balance)
 
         # ── Yeni sinyal ──────────────────────────────────────────────────────
         if pos is None:
@@ -292,6 +317,34 @@ def run_backtest(
             pos["risk_amount"] = risk_amount
             pos["_funding_cost"] = 0.0
             pos["_funding_charged"] = 0
+
+    # DENETİM: koşu bitince açık pozisyon öylece bırakılıyordu. Zararda kapanan
+    # bir testte o zarar hiç raporlanmıyor, yani sonuç iyimser çıkıyordu.
+    if pos is not None:
+        last_px = float(df_5m.iloc[-1]["close"])
+        fill = _apply_slippage(last_px, pos["side"], is_entry=False)
+        gross = ((fill - pos["entry_price"]) if pos["side"] == "BUY"
+                 else (pos["entry_price"] - fill)) * pos["qty"]
+        comm = pos["qty"] * fill * COMMISSION_RATE
+        net = gross - comm
+        balance += pos["margin"] + net
+        total_net = (net + pos["realized_pnl"] - pos.get("_funding_cost", 0.0)
+                     - pos.get("open_commission", 0.0))
+        total_comm = comm + pos["realized_commission"] + pos.get("open_commission", 0.0)
+        trades.append({
+            "time": df_5m.index[-1], "symbol": symbol, "side": pos["side"],
+            "entry": pos["entry_price"], "exit": fill, "reason": "END_OF_TEST",
+            "gross": total_net + total_comm, "comm": total_comm,
+            "funding": pos.get("_funding_cost", 0.0), "net": total_net,
+            "r": realized_r(pos, total_net),
+            "mfe_r": pos["mfe_r"], "mae_r": pos["mae_r"],
+            "margin": pos["initial_margin"], "leverage": pos["leverage"],
+            "duration_min": (df_5m.index[-1] - pos["open_time"]).total_seconds() / 60,
+            "strategy": pos.get("strategy", strategy),
+            "tp1": pos["tp1_done"], "tp2": pos["tp2_done"],
+        })
+        equity_curve.append(balance)
+        pos = None
 
     if not trades:
         print("⚠️  Hiç işlem gerçekleşmedi.")

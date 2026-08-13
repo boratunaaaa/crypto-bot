@@ -20,6 +20,7 @@ from config import (
     EMA_FAST, EMA_SLOW, EMA_TREND,
     USE_ELITE_COINS, ELITE_COINS,
     MIN_QUOTE_VOLUME_24H, MAX_SPREAD_PCT,
+    SPOT_MODE, MAX_PRICE_AGE_SEC,
 )
 
 logger = logging.getLogger("market_data")
@@ -293,10 +294,21 @@ class MarketDataManager:
                                 self._prices[sym] = float(price)
                                 self._price_ts[sym] = now
 
-            twm.start_miniticker_socket(callback=on_ticker)
+            # DENETİM BULGUSU (kritik): burada `start_miniticker_socket`
+            # kullanılıyordu — o python-binance'te SPOT akışıdır. Futures botu
+            # göstergelerini Futures mumlarından, anlık giriş/stop kararlarını
+            # ise Spot fiyatından üretiyordu. Futures-only coinlerde fiyat hiç
+            # gelmiyor, gelenlerde basis farkı yanlış giriş/çıkış üretiyordu.
+            # Paper/canlı pariteyi de doğrudan bozuyordu.
+            if SPOT_MODE:
+                twm.start_miniticker_socket(callback=on_ticker)
+                stream = "spot miniTicker"
+            else:
+                twm.start_all_ticker_futures_socket(callback=on_ticker)
+                stream = "futures ticker"
             self._twm = twm
             self._last_ws_msg = time.time()
-            logger.info("WebSocket başlatıldı")
+            logger.info(f"WebSocket başlatıldı ({stream})")
         except Exception as e:
             logger.error(f"WebSocket başlatma hatası: {e}")
             self._twm = None
@@ -518,9 +530,30 @@ class MarketDataManager:
 
     # ── Erişim (thread-safe) ─────────────────────────────────────────────────
 
-    def get_price(self, symbol: str) -> float | None:
+    def get_price(self, symbol: str, max_age: float | None = None) -> float | None:
+        """
+        Son fiyat. Bayatsa None döner.
+
+        DENETİM BULGUSU: tazelik hiç kontrol edilmiyordu. WebSocket sessizce
+        düşerse `_prices` sözlüğünde saatler önceki fiyat durur ve yeni pozisyon
+        o fiyatla açılabilirdi. Açık pozisyonlar için main.py zaten taze fiyat
+        çekiyordu (2026-08-07 WS olayı), ama GİRİŞ tarafında böyle bir koruma
+        yoktu — yani en pahalı yönde açıktı.
+        """
+        limit = MAX_PRICE_AGE_SEC if max_age is None else max_age
         with self._lock:
-            return self._prices.get(symbol)
+            px = self._prices.get(symbol)
+            if px is None:
+                return None
+            ts = self._price_ts.get(symbol, 0.0)
+            if limit and (time.time() - ts) > limit:
+                return None
+            return px
+
+    def price_age(self, symbol: str) -> float:
+        with self._lock:
+            ts = self._price_ts.get(symbol)
+        return float("inf") if not ts else time.time() - ts
 
     def get_ohlcv(self, symbol: str, tf: str = TF_ENTRY) -> pd.DataFrame | None:
         with self._lock:

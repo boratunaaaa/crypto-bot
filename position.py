@@ -32,7 +32,7 @@ from config import (
     PARTIAL_TP2_R, PARTIAL_TP2_PCT,
     BREAKEVEN_AFTER_TP1, BREAKEVEN_BUFFER_PCT,
     CHANDELIER_ATR_MULT_STRONG, CHANDELIER_ATR_MULT_WEAK,
-    CHANDELIER_MIN_LOCK_R, TRAIL_MOMENTUM_LOOKBACK,
+    CHANDELIER_MIN_LOCK_R, TRAIL_MOMENTUM_LOOKBACK, TRAIL_MOMENTUM_SECONDS,
     TIME_STOP_ENABLED, TIME_STOP_MINUTES, TIME_STOP_MIN_MFE_R, TIME_STOP_MAX_MINUTES,
 )
 
@@ -151,21 +151,29 @@ def _tighten_stop(pos: dict, new_stop: float, kind: str) -> bool:
     return False
 
 
-def _update_excursions(pos: dict, price: float) -> None:
-    """MFE/MAE takibi + zirveden bu yana geçen tick sayısı (momentum göstergesi)."""
+def _update_excursions(pos: dict, price: float, now: datetime | None = None) -> None:
+    """
+    MFE/MAE takibi + zirveden bu yana geçen SÜRE (momentum göstergesi).
+
+    DENETİM BULGUSU: momentum "kaç döngü geçti" ile ölçülüyordu. Tarama süresi
+    ağ/API yüküne göre 30 saniyeden 3 dakikaya çıkabiliyor; o zaman "güçlü
+    momentum" tanımı sessizce değişiyor ve trailing davranışı sebepsiz
+    sıkılaşıyordu. Artık zaman damgası esas, tick sayacı yalnız uyumluluk için.
+    """
+    now = now or datetime.now()
+    new_peak = (price > pos["peak"]) if pos["side"] == "BUY" else (price < pos["peak"])
+    if new_peak:
+        pos["peak"] = price
+        pos["ticks_since_peak"] = 0
+        pos["peak_at"] = now
+    else:
+        pos["ticks_since_peak"] += 1
+    pos.setdefault("peak_at", pos["open_time"])
+    pos["secs_since_peak"] = (now - pos["peak_at"]).total_seconds()
+
     if pos["side"] == "BUY":
-        if price > pos["peak"]:
-            pos["peak"] = price
-            pos["ticks_since_peak"] = 0
-        else:
-            pos["ticks_since_peak"] += 1
         pos["trough"] = min(pos["trough"], price)
     else:
-        if price < pos["peak"]:
-            pos["peak"] = price
-            pos["ticks_since_peak"] = 0
-        else:
-            pos["ticks_since_peak"] += 1
         pos["trough"] = max(pos["trough"], price)
 
     pos["mfe_r"] = max(pos["mfe_r"], _r_multiple(pos, pos["peak"]))
@@ -179,9 +187,24 @@ def _chandelier_stop(pos: dict) -> float:
     Çarpan momentuma göre uyarlanır — hareket devam ederken geniş (hareketi
     boğmamak için), zirveden uzaklaşıldıkça dar (kârı korumak için).
     SABİT BİR ÜST HEDEF YOKTUR; coin ne kadar giderse pozisyon o kadar taşınır.
+
+    DENETİM BULGUSU (kritik): ATR'nin MUTLAK değeri giriş fiyatında donduruluyordu
+    (`atr_pct * entry_price`). Fiyat katlandıkça pad oransal olarak daralıyordu:
+    3 katına çıkmış bir coinde stop zirvenin yalnız %1.47 altında kalıyordu —
+    ölçülen ortalama 5dk ATR %1.26 olduğu için stop gürültü bandının İÇİNDE.
+    Yani coin ne kadar çok kazandırırsa tasması o kadar kısalıyordu; "üst
+    limitsiz maksimum kazanç" hedefinin tam tersi.
+
+    Doğru Chandelier GÜNCEL ATR kullanır. `atr_abs_now` besleniyorsa o kullanılır;
+    beslenmiyorsa ATR yüzdesi ZİRVE fiyatına uygulanır — oransal daralmayı
+    ortadan kaldıran, volatilite sabit varsayımıyla çalışan ara çözüm.
     """
-    atr_abs = max(pos.get("atr_pct", 0.01), 0.001) * pos["entry_price"]
-    strong = pos["ticks_since_peak"] <= TRAIL_MOMENTUM_LOOKBACK
+    fresh = pos.get("atr_abs_now")
+    if fresh and fresh > 0:
+        atr_abs = fresh
+    else:
+        atr_abs = max(pos.get("atr_pct", 0.01), 0.001) * pos["peak"]
+    strong = pos.get("secs_since_peak", 0.0) <= TRAIL_MOMENTUM_SECONDS
     mult = CHANDELIER_ATR_MULT_STRONG if strong else CHANDELIER_ATR_MULT_WEAK
     pad = atr_abs * mult
 
@@ -222,6 +245,9 @@ def evaluate(pos: dict, price: float, now: datetime | None = None) -> list[dict]
 
     # 1) Mevcut stop'a çarpıldı mı? (bir önceki tick'te belirlenmiş stop ile)
     if _stop_hit(pos, price):
+        # DENETİM: son fiyat MAE'ye işlenmiyordu; stopun ötesine sıçrayan
+        # hareketlerde raporlanan MAE olduğundan iyi görünüyordu.
+        _update_excursions(pos, price, now)
         reason = _EXIT_BY_STOP_KIND.get(pos["stop_kind"], EXIT_INITIAL_STOP)
         actions.append({"type": "CLOSE", "fraction": 1.0, "reason": reason, "price": price})
         return actions

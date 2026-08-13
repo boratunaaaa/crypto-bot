@@ -23,6 +23,8 @@ from config import (
     MOMENTUM_ENABLED, MOMENTUM_SHADOW_MODE, MOMENTUM_MIN_SCORE,
     HEARTBEAT_ENABLED, HEARTBEAT_INTERVAL_MIN, STALE_ALERT_MINUTES,
     DAILY_RISK_BUDGET_R, MAX_SPREAD_PCT,
+    CORRELATION_GUARD_ENABLED, MAX_NET_DIRECTIONAL_R,
+    STRESS_SHOCK_PCT, MAX_STRESS_LOSS_R, BETA_LOOKBACK_BARS,
 )
 from market_data import MarketDataManager
 from analyzer import analyze_all
@@ -33,6 +35,7 @@ from risk_manager import (
     portfolio_open_risk_r,
     KillSwitchTracker,
     dynamic_risk_pct,
+    allocated_r,
 )
 from trader import create_trader, PaperPortfolio
 from dashboard import build_layout
@@ -41,10 +44,12 @@ from database import (
     init_db, save_missed_signal, get_performance_summary,
     get_summary_excluding_top, get_recent_pnls,
     state_get, state_set_many, load_open_positions, save_open_positions,
-    save_shadow_signal,
+    save_shadow_signal, save_equity_snapshot,
+    get_pending_shadow_signals, update_shadow_outcome,
 )
 from telegram_bot import TelegramBot
 import momentum as momentum_mod
+import correlation as corr
 
 logging.basicConfig(
     level=logging.INFO,
@@ -140,6 +145,87 @@ def run():
 
     # ── Telegram bot + komutlar ────────────────────────────────────────────
     tg = TelegramBot()
+
+    def _evaluate_shadow_signals(mdm) -> int:
+        """
+        Bekleyen gölge sinyalleri sonuçlandır.
+
+        Momentum stratejisi gölge modda çalışıyor: sinyaller kaydediliyor ama
+        işlem açılmıyor. Canlıya alma kararı bu kayıtların SONUCUNA bakılarak
+        verilecek — ama sonuç hesaplayan kod hiç çağrılmıyordu, kayıtlar
+        süresiz PENDING kalıyordu. Yani karar için gereken kanıt üretilmiyordu.
+
+        Ölçüt basit ve stratejinin kendi çıkış mantığıyla uyumlu: sinyalden
+        sonraki en uç lehte/aleyhte hareket. +1R'ye eşdeğer hareket önce
+        geldiyse WIN, stop mesafesi önce geldiyse LOSS.
+        """
+        from config import SL_ATR_MULT
+        pending = get_pending_shadow_signals(max_age_min=240)
+        done = 0
+        for row in pending:
+            df = mdm.get_ohlcv(row["symbol"])
+            if df is None or len(df) < 5:
+                continue
+            try:
+                ts = datetime.fromisoformat(row["timestamp"])
+            except (TypeError, ValueError):
+                continue
+            after = df[df.index > ts] if hasattr(df.index, "__gt__") else None
+            if after is None or len(after) < 3:
+                continue
+
+            entry = float(row["price"])
+            if entry <= 0:
+                continue
+            hi = float(after["high"].max())
+            lo = float(after["low"].min())
+            if row["action"] == "BUY":
+                peak_pct, trough_pct = (hi - entry) / entry, (lo - entry) / entry
+            else:
+                peak_pct, trough_pct = (entry - lo) / entry, (entry - hi) / entry
+
+            # Stop mesafesi sinyaldeki ATR'den; yoksa muhafazakâr %2.
+            feats = row.get("features") or {}
+            atr_pct = float(feats.get("atr_pct", 0.01)) if isinstance(feats, dict) else 0.01
+            stop_pct = max(atr_pct * SL_ATR_MULT, 0.005)
+
+            if trough_pct <= -stop_pct:
+                outcome = "LOSS"          # önce stop'a değdi varsayımı (muhafazakâr)
+            elif peak_pct >= stop_pct:
+                outcome = "WIN"
+            else:
+                continue                  # henüz sonuçlanmadı
+            update_shadow_outcome(row["id"], outcome, peak_pct, trough_pct)
+            done += 1
+        if done:
+            logger.info(f"Gölge sinyal değerlendirildi: {done} kayıt sonuçlandı")
+        return done
+
+    def _betas_for(symbols) -> dict:
+        """
+        Sembollerin BTC'ye betası — 5m getirilerinden.
+
+        Veri yoksa 1.0 döner: bilinmeyen maruziyeti sıfır saymak, tam da
+        korunmak istediğimiz riski görünmez kılardı.
+        """
+        out = {}
+        try:
+            btc = mdm.get_ohlcv("BTCUSDT")
+            if btc is None or len(btc) < 30:
+                return {s: 1.0 for s in symbols}
+            btc_r = corr.returns(list(btc["close"])[-BETA_LOOKBACK_BARS:])
+            for s in symbols:
+                df = mdm.get_ohlcv(s)
+                if df is None or len(df) < 30:
+                    out[s] = 1.0
+                    continue
+                out[s] = corr.beta_to(
+                    corr.returns(list(df["close"])[-BETA_LOOKBACK_BARS:]), btc_r
+                )
+        except Exception as e:
+            logger.debug(f"Beta hesaplanamadı: {e}")
+            return {s: 1.0 for s in symbols}
+        return out
 
     def _equity():
         if isinstance(trader, PaperPortfolio):
@@ -357,10 +443,25 @@ def run():
     from trader import SpotTrader, FuturesTrader
     from binance.client import Client as _Client
     from config import API_KEY as _KEY, API_SECRET as _SEC
+    from config import TESTNET, AUTO_LIQUIDATE_SPOT
 
-    if isinstance(trader, (SpotTrader, FuturesTrader)):
-        cl = _Client(_KEY, _SEC)
-        console.print("[yellow]Spot coinler kontrol ediliyor...[/yellow]")
+    # DENETİM BULGUSU (en tehlikeli): burası gerçek modda AÇILIŞTA spot
+    # hesaptaki USDT/BNB dışındaki TÜM varlıkları satıyordu. Bayrak yok,
+    # allowlist yok, onay yok. systemd `Restart=always` altında her çökme
+    # bunu tekrarlıyordu — botla hiç ilgisi olmayan kişisel coinler de
+    # tasfiye olabilirdi. Artık varsayılan KAPALI; yalnız açıkça istenirse
+    # (`--prepare-capital` veya AUTO_LIQUIDATE_SPOT=True) çalışır.
+    _prepare_capital = AUTO_LIQUIDATE_SPOT or "--prepare-capital" in sys.argv
+
+    if isinstance(trader, (SpotTrader, FuturesTrader)) and not _prepare_capital:
+        console.print(
+            "[dim]Spot tasfiyesi atlandı (AUTO_LIQUIDATE_SPOT=False). "
+            "Sermaye hazırlamak için: --prepare-capital[/dim]"
+        )
+
+    if isinstance(trader, (SpotTrader, FuturesTrader)) and _prepare_capital:
+        cl = _Client(_KEY, _SEC, testnet=TESTNET)
+        console.print("[yellow]⚠ Spot varlıklar USDT'ye çevriliyor...[/yellow]")
         try:
             for b in cl.get_account()["balances"]:
                 asset, free = b["asset"], float(b["free"])
@@ -410,6 +511,11 @@ def run():
     last_ticker       = time.time()
     last_state_save   = 0.0
     _ks_notified      = False
+    _guard_notified: dict = {}
+    last_shadow_eval  = 0.0
+    # symbol -> o işleme ayrılan R (bütçe iadesini sınırlamak için)
+    _alloc_of: dict = {p: pos.get("allocated_r", 1.0)
+                       for p, pos in getattr(trader, "positions", {}).items()}
     momentum_signals: list = []
 
     with Live(console=console, refresh_per_second=2, screen=True) as live:
@@ -443,7 +549,10 @@ def run():
                     logger.info(
                         f"KAPANDI: {sym} | {reason} | PnL:{pnl:+.2f}$ ({r_mult:+.2f}R)"
                     )
-                    kill_switch.record_trade_close(pnl, _equity(), realized_r=r_mult, symbol=sym)
+                    kill_switch.record_trade_close(
+                        pnl, _equity(), realized_r=r_mult, symbol=sym,
+                        allocated=_alloc_of.pop(sym, 1.0),
+                    )
                     tg.notify_close(sym, "", prices.get(sym, 0), pnl, reason)
                 if closed:
                     _save_state()
@@ -510,6 +619,31 @@ def run():
             else:
                 _ks_notified = False
 
+            # ── Koruma bütünlüğü ──────────────────────────────────────────
+            # Korumasız veya sahipsiz pozisyon varsa yeni işlem AÇILMAZ. Borsa
+            # tarafındaki koruma, botun belleğindeki stop'tan daha önemlidir:
+            # süreç ölürse bellekteki stop da ölür, borsadaki emir kalır.
+            guard_issues = {
+                **{s: f"korumasız ({r})" for s, r in getattr(trader, "unprotected", {}).items()},
+                **{s: f"sahipsiz ({r})" for s, r in getattr(trader, "orphans", {}).items()},
+            }
+            if guard_issues:
+                can_trade = False
+                ks_reason = "Koruma bütünlüğü bozuk: " + ", ".join(
+                    f"{s} {r}" for s, r in guard_issues.items()
+                )
+                logger.error(ks_reason)
+                if guard_issues != _guard_notified:
+                    tg.send(
+                        "🚨 KORUMA UYARISI\n\n"
+                        + "\n".join(f"• {s}: {r}" for s, r in guard_issues.items())
+                        + "\n\nYeni işlem açılmayacak. Binance'i elle kontrol et."
+                    )
+                    _guard_notified = dict(guard_issues)
+            elif _guard_notified:
+                tg.send("✅ Koruma bütünlüğü normale döndü.")
+                _guard_notified = {}
+
             # ── İşlem kararları ───────────────────────────────────────────
             positions = getattr(trader, "positions", {})
 
@@ -570,6 +704,24 @@ def run():
                     )
                     continue
 
+                # Gerçek korelasyon kapısı — sayı değil, BİRLİKTE HAREKET.
+                # Yön limiti (MAX_CORRELATED_POSITIONS) 4 alt long'a izin verir;
+                # BTC %5 düşerse dördü birden stop olur. Bu kapı onu ölçer.
+                if CORRELATION_GUARD_ENABLED and positions:
+                    betas = _betas_for(list(positions.keys()) + [sig.symbol])
+                    ok_corr, corr_reason = corr.can_add_correlated(
+                        positions, sig.symbol, sig.action, 1.0, betas,
+                        max_net_r=MAX_NET_DIRECTIONAL_R,
+                        max_stress_r=MAX_STRESS_LOSS_R,
+                        shock_pct=STRESS_SHOCK_PCT,
+                    )
+                    if not ok_corr:
+                        save_missed_signal(
+                            sig.symbol, sig.action, sig.score, sig.confidence,
+                            corr_reason, btc_trend, sig.market_regime,
+                        )
+                        continue
+
                 # Momentum stratejisi kendi izole bütçesini aşamaz
                 if strategy == "MOMENTUM_FAST":
                     ok_mom, mom_reason = kill_switch.can_trade(equity, strategy="MOMENTUM_FAST")
@@ -592,6 +744,40 @@ def run():
                 leverage = calculate_leverage(sig.confidence, sig.score)
                 risk_pct = dynamic_risk_pct(get_recent_pnls(30), sig.score)
                 open_margin = sum(p.get("margin", 0.0) for p in positions.values())
+
+                # DENETİM: `can_trade` aday DÖNGÜSÜNDEN ÖNCE bir kez
+                # çalışıyordu. Aynı taramada arka arkaya açılan pozisyonlar
+                # günlük 8R bütçesini aşabiliyordu. Her adaydan hemen önce,
+                # o adayın GERÇEK riskiyle yeniden kontrol ediliyor.
+                alloc_r = allocated_r(risk_pct)
+                ok_budget, budget_reason = kill_switch.can_trade(equity, strategy=strategy)
+                if not ok_budget or kill_switch.risk_budget_remaining() < alloc_r:
+                    save_missed_signal(
+                        sig.symbol, sig.action, sig.score, sig.confidence,
+                        budget_reason if not ok_budget else
+                        f"Bütçe yetersiz ({kill_switch.risk_budget_remaining():.1f}R < {alloc_r:.1f}R)",
+                        btc_trend, sig.market_regime,
+                    )
+                    continue
+
+                ok_port, port_reason = can_add_position(positions, equity, new_risk_r=alloc_r)
+                if not ok_port:
+                    save_missed_signal(
+                        sig.symbol, sig.action, sig.score, sig.confidence,
+                        port_reason, btc_trend, sig.market_regime,
+                    )
+                    continue
+
+                # Bayat fiyatla pozisyon açma — sinyal üretimi ile emir arasında
+                # WebSocket düşmüş olabilir.
+                fresh_px = mdm.get_price(sig.symbol)
+                if fresh_px is None:
+                    save_missed_signal(
+                        sig.symbol, sig.action, sig.score, sig.confidence,
+                        f"Fiyat bayat ({mdm.price_age(sig.symbol):.0f}s)",
+                        btc_trend, sig.market_regime,
+                    )
+                    continue
 
                 margin, qty, risk_amount, err = calculate_position(
                     equity, leverage, sig.price, sig.sl, risk_pct,
@@ -628,7 +814,10 @@ def run():
                     entry_snapshot=snapshot,
                 )
                 if ok:
-                    kill_switch.record_trade_open(equity, risk_r=1.0, strategy=strategy)
+                    kill_switch.record_trade_open(equity, risk_r=alloc_r, strategy=strategy)
+                    if sig.symbol in trader.positions:
+                        trader.positions[sig.symbol]["allocated_r"] = alloc_r
+                    _alloc_of[sig.symbol] = alloc_r
                     positions = trader.positions
                     logger.info(
                         f"AÇILDI [{strategy}]: {sig.symbol} {sig.action} "
@@ -647,9 +836,31 @@ def run():
                 else:
                     logger.warning(f"Açılamadı {sig.symbol}: {msg}")
 
-            # ── Periyodik state kaydı ──────────────────────────────────────
+            # ── Gölge sinyal değerlendirmesi ───────────────────────────────
+            # DENETİM: gölge sinyaller kaydediliyor ama sonuçları HİÇ
+            # değerlendirilmiyordu; kayıtlar sonsuza kadar PENDING kalıyordu.
+            # Yani momentum stratejisini canlıya almak için gereken kanıt
+            # hiç üretilmiyordu.
+            if time.time() - last_shadow_eval >= 300:
+                try:
+                    _evaluate_shadow_signals(mdm)
+                except Exception as e:
+                    logger.debug(f"Gölge değerlendirme hatası: {e}")
+                last_shadow_eval = time.time()
+
+            # ── Periyodik state kaydı + equity örneklemesi ─────────────────
             if time.time() - last_state_save >= 60:
                 _save_state()
+                # Gerçek drawdown yalnız kapanmış işlemlerden ölçülemez; açık
+                # pozisyonun anlık zararını görebilmek için düzenli örnek şart.
+                save_equity_snapshot(
+                    equity=_equity(),
+                    balance=trader.balance if isinstance(trader, PaperPortfolio)
+                            else trader.get_balance(),
+                    open_positions=len(getattr(trader, "positions", {})),
+                    open_risk_r=portfolio_open_risk_r(getattr(trader, "positions", {})),
+                    mode="paper" if PAPER_TRADING else "live",
+                )
                 last_state_save = time.time()
 
             # ── Dashboard ───────────────────────────────────────────────────

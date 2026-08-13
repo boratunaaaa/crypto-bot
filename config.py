@@ -84,6 +84,16 @@ MAX_CORRELATED_POSITIONS  = 4      # aynı yönde en fazla 4
 MIN_MARGIN_USDT           = 5.0
 MAX_PORTFOLIO_RISK_R      = 4.0    # aynı anda açık toplam risk: max 4R
 
+# ─── Korelasyon / stres limiti ───────────────────────────────────────────────
+# `MAX_CORRELATED_POSITIONS` sayı sayar, birlikte hareketi görmez. Kriptoda
+# altcoin'ler BTC ile yüksek korelasyonludur: 4 ayrı alt long, dört bağımsız
+# 1R bahsi DEĞİL, tek bir 4R'lik BTC bahsidir. Bu iki tavan onu ölçer.
+CORRELATION_GUARD_ENABLED = True
+MAX_NET_DIRECTIONAL_R     = 3.0    # beta ağırlıklı net yön maruziyeti
+STRESS_SHOCK_PCT          = 0.05   # BTC'de ani %5 hareket senaryosu
+MAX_STRESS_LOSS_R         = 3.0    # o şokta izin verilen toplam zarar
+BETA_LOOKBACK_BARS        = 120
+
 # ─── Kill Switch ──────────────────────────────────────────────────────────────
 # Günlük RİSK BÜTÇESİ — işlem sayısı limitinin yerini alır.
 # Her açılan işlem bütçeden riski kadar (1R) düşer. Kapanan kârlı işlem
@@ -104,9 +114,31 @@ KILL_SWITCH_COOLDOWN_HOURS = 2
 # Aynı sembolde arka arkaya işlem açmadan önce bekleme (dakika)
 SYMBOL_COOLDOWN_MIN    = 30
 
-# ─── Komisyon / slippage ──────────────────────────────────────────────────────
+# ─── Komisyon / slippage / funding ────────────────────────────────────────────
 COMMISSION_RATE = 0.0005   # %0.05 taker fee (her açma/kapamada, notional üzerinden)
-SLIPPAGE_PCT    = 0.0004   # backtest ve breakeven hesabında varsayılan kayma
+SLIPPAGE_PCT    = 0.0004   # taban kayma — backtest VE paper, ikisi de uygular
+
+# Stop emirleri piyasa emridir ve hareketin sert olduğu anda tetiklenir; normal
+# emirden daha kötü dolar. Kâğıt sonucun canlıyı olduğundan iyi göstermemesi
+# için stop çıkışlarına ek kayma uygulanır.
+SLIPPAGE_STOP_MULT = 2.5
+
+# Perpetual funding — 8 saatte bir, notional üzerinden.
+FUNDING_RATE_8H = 0.0001
+
+# ─── Veri tazeliği ────────────────────────────────────────────────────────────
+# Bayat fiyatla pozisyon AÇILMAZ. WebSocket sessizce düşerse eski fiyat
+# sözlükte kalıyor ve fark edilmiyordu.
+MAX_PRICE_AGE_SEC = 20
+MAX_OHLCV_AGE_SEC = 600
+
+# ─── Sermaye hazırlama ────────────────────────────────────────────────────────
+# DENETİM BULGUSU: bot gerçek modda AÇILIŞTA spot hesaptaki USDT/BNB dışındaki
+# TÜM varlıkları satıyordu — bayrak yok, onay yok. systemd `Restart=always`
+# altında her çökme-yeniden başlatmada tekrarlanıyordu, yani botla ilgisi
+# olmayan kişisel coinler de tasfiye olabilirdi. Artık varsayılan KAPALI ve
+# yalnız `--prepare-capital` bayrağıyla elle çalıştırılır.
+AUTO_LIQUIDATE_SPOT = False
 
 # ─── Kaldıraç ─────────────────────────────────────────────────────────────────
 # Kaldıraç artık KÂRI DEĞİŞTİRMEZ (risk-bazlı boyutlandırmada notional
@@ -152,7 +184,8 @@ BREAKEVEN_BUFFER_PCT  = 0.0015  # giriş + %0.15 (round-trip komisyon %0.10'u a�
 CHANDELIER_ATR_MULT_STRONG = 3.5   # momentum güçlü → geniş bırak, hareketi boğma
 CHANDELIER_ATR_MULT_WEAK   = 1.8   # momentum zayıfladı → sıkılaştır, kârı koru
 CHANDELIER_MIN_LOCK_R      = 0.30  # trailing devreye girince en az 0.30R kilitli
-TRAIL_MOMENTUM_LOOKBACK    = 8     # son N döngüde yeni zirve varsa "güçlü" sayılır
+TRAIL_MOMENTUM_LOOKBACK    = 8     # (eski, döngü tabanlı — yalnız uyumluluk)
+TRAIL_MOMENTUM_SECONDS     = 240   # son 4 dakikada yeni zirve varsa "güçlü"
 
 # Geriye dönük uyumluluk (eski kod yolları / backtest)
 TRAIL_AFTER_TP        = True
