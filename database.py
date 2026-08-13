@@ -20,7 +20,18 @@ logger = logging.getLogger("database")
 
 # Testler canlı trades.db'ye yazmasın diye yol ayarlanabilir.
 # Üretimde bu değişken tanımlı değildir ve varsayılan dosya kullanılır.
-DB_PATH = Path(os.environ.get("CRYPTO_BOT_DB", Path(__file__).parent / "trades.db"))
+# DENETİM BULGUSU: paper ve live aynı veritabanını, aynı kill switch state'ini
+# ve aynı işlem geçmişini kullanıyordu. Moda geçildiğinde kâğıt verisi canlı
+# risk kararlarını (günlük zarar, drawdown, dinamik risk) besliyordu — ve
+# go-live kapıları iki modun işlemlerini birbirine karıştırabiliyordu.
+# Artık her mod kendi dosyasında.
+def _default_db() -> Path:
+    from config import PAPER_TRADING
+    name = "trades.db" if PAPER_TRADING else "trades_live.db"
+    return Path(__file__).parent / name
+
+
+DB_PATH = Path(os.environ.get("CRYPTO_BOT_DB") or _default_db())
 
 
 def _conn():
@@ -45,6 +56,7 @@ CREATE TABLE IF NOT EXISTS missed_signals (
 );
 
 CREATE TABLE IF NOT EXISTS trades (
+    mode          TEXT DEFAULT 'paper',
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol        TEXT    NOT NULL,
     side          TEXT    NOT NULL,
@@ -158,6 +170,13 @@ _TRADE_COLUMNS = [
 
 
 def _migrate(con):
+    # Eski veritabanlarında `mode` sütunu yok.
+    try:
+        cols = {r[1] for r in con.execute("PRAGMA table_info(trades)")}
+        if "mode" not in cols:
+            con.execute("ALTER TABLE trades ADD COLUMN mode TEXT DEFAULT 'paper'")
+    except Exception:
+        pass
     """Mevcut veriyi bozmadan eksik kolonları ekle."""
     existing = {r["name"] for r in con.execute("PRAGMA table_info(trades)")}
     added = []

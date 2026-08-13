@@ -22,7 +22,7 @@ from config import (
     MAX_CORRELATED_POSITIONS, MIN_CONFIDENCE, MIN_MARGIN_USDT, PAPER_BALANCE,
     MOMENTUM_ENABLED, MOMENTUM_SHADOW_MODE, MOMENTUM_MIN_SCORE,
     HEARTBEAT_ENABLED, HEARTBEAT_INTERVAL_MIN, STALE_ALERT_MINUTES,
-    DAILY_RISK_BUDGET_R, MAX_SPREAD_PCT,
+    DAILY_RISK_BUDGET_R, MAX_SPREAD_PCT, MAX_PRICE_AGE_SEC,
     CORRELATION_GUARD_ENABLED, MAX_NET_DIRECTIONAL_R,
     STRESS_SHOCK_PCT, MAX_STRESS_LOSS_R, BETA_LOOKBACK_BARS,
 )
@@ -529,10 +529,37 @@ def run():
             # asla stop kontrolü yapma — 2026-08-07 WS olayı)
             held_positions = getattr(trader, "positions", {})
             if held_positions:
-                prices.update(mdm.get_prices_for(list(held_positions.keys())))
+                fresh = mdm.get_prices_for(list(held_positions.keys()))
+                prices.update(fresh)
+                # DENETİM BULGUSU: REST yenilemesi BAŞARISIZ olursa sözlükteki
+                # eski WebSocket fiyatı yerinde kalıyor ve stop motoru onu
+                # kullanmaya devam ediyordu. Bayat fiyatla stop kararı vermek,
+                # kararı hiç vermemekten kötüdür.
+                for _sym in list(held_positions):
+                    if _sym not in fresh and mdm.price_age(_sym) > MAX_PRICE_AGE_SEC * 3:
+                        prices.pop(_sym, None)
+                        logger.warning(
+                            f"{_sym}: fiyat bayat ({mdm.price_age(_sym):.0f}s) — "
+                            f"bu turda çıkış değerlendirilmiyor"
+                        )
+            if hasattr(trader, "mark"):
+                trader.mark(prices)
 
             if hasattr(trader, "sync_positions"):
                 trader.sync_positions()
+                # Borsa stopuyla kapanan işlemler kill switch'e İŞLENMELİ.
+                # Gerçek modda en sık kapanış yolu budur; buraya bağlanmazsa
+                # günlük zarar limiti ve ardışık kayıp sayacı kör kalır.
+                for sym, reason, pnl, r_mult, alloc in getattr(trader, "exchange_closed", []):
+                    logger.info(f"BORSA KAPANIŞI: {sym} | {reason} | {pnl:+.2f}$ ({r_mult:+.2f}R)")
+                    kill_switch.record_trade_close(
+                        pnl, _equity(), realized_r=r_mult, symbol=sym, allocated=alloc,
+                    )
+                    tg.notify_close(sym, "", 0.0, pnl, reason)
+                    _alloc_of.pop(sym, None)
+                if getattr(trader, "exchange_closed", None):
+                    trader.exchange_closed.clear()
+                    _save_state()
 
             if hasattr(trader, "sync_balance"):
                 now = time.perf_counter()
@@ -704,13 +731,19 @@ def run():
                     )
                     continue
 
+                # Bu adayın gerçek risk ağırlığı. Korelasyon kapısı da bunu
+                # kullanmalı: %0.4 riskli işlemle %1.2 riskli işlem aynı
+                # maruziyeti üretmez.
+                _risk_pct_probe = dynamic_risk_pct(get_recent_pnls(30), sig.score)
+                alloc_r = allocated_r(_risk_pct_probe)
+
                 # Gerçek korelasyon kapısı — sayı değil, BİRLİKTE HAREKET.
                 # Yön limiti (MAX_CORRELATED_POSITIONS) 4 alt long'a izin verir;
                 # BTC %5 düşerse dördü birden stop olur. Bu kapı onu ölçer.
                 if CORRELATION_GUARD_ENABLED and positions:
                     betas = _betas_for(list(positions.keys()) + [sig.symbol])
                     ok_corr, corr_reason = corr.can_add_correlated(
-                        positions, sig.symbol, sig.action, 1.0, betas,
+                        positions, sig.symbol, sig.action, alloc_r, betas,
                         max_net_r=MAX_NET_DIRECTIONAL_R,
                         max_stress_r=MAX_STRESS_LOSS_R,
                         shock_pct=STRESS_SHOCK_PCT,
@@ -742,14 +775,13 @@ def run():
                     continue
 
                 leverage = calculate_leverage(sig.confidence, sig.score)
-                risk_pct = dynamic_risk_pct(get_recent_pnls(30), sig.score)
+                risk_pct = _risk_pct_probe
                 open_margin = sum(p.get("margin", 0.0) for p in positions.values())
 
                 # DENETİM: `can_trade` aday DÖNGÜSÜNDEN ÖNCE bir kez
                 # çalışıyordu. Aynı taramada arka arkaya açılan pozisyonlar
                 # günlük 8R bütçesini aşabiliyordu. Her adaydan hemen önce,
                 # o adayın GERÇEK riskiyle yeniden kontrol ediliyor.
-                alloc_r = allocated_r(risk_pct)
                 ok_budget, budget_reason = kill_switch.can_trade(equity, strategy=strategy)
                 if not ok_budget or kill_switch.risk_budget_remaining() < alloc_r:
                     save_missed_signal(

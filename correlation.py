@@ -156,10 +156,18 @@ def can_add_correlated(positions: dict, symbol: str, side: str,
     """
     betas = betas or {}
     probe = dict(positions)
+    # DENETİM BULGUSU: probe `qty=new_risk_r, risk_amount=new_risk_r*2` ile
+    # kuruluyordu. open_r = (100-98)*qty/risk_amount = 1.0 — yani new_risk_r
+    # ne olursa olsun SONUÇ HEP 1R çıkıyordu. %0.4 riskli işlemle %1.2 riskli
+    # işlem aynı maruziyeti üretiyordu ve kapı gerçek riski hiç görmüyordu.
+    #
+    # Doğrusu: risk_amount'ı, kalan riskin tam olarak `new_risk_r` R çıkacağı
+    # şekilde ölçekle. per_unit=2, qty=1 → risk_amount = 2/new_risk_r.
+    r = max(float(new_risk_r), 1e-9)
     probe[f"__probe__{symbol}"] = {
         "symbol": symbol, "side": side, "entry_price": 100.0,
         "stop_loss": 98.0 if side == "BUY" else 102.0,
-        "qty": new_risk_r, "risk_amount": new_risk_r * 2.0,
+        "qty": 1.0, "risk_amount": 2.0 / r,
     }
     b = dict(betas)
     b[f"__probe__{symbol}"] = betas.get(symbol, 1.0)

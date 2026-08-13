@@ -131,6 +131,22 @@ def _breakeven_price(pos: dict) -> float:
     return pos["entry_price"] * (1 - buffer)
 
 
+def confirm_partial(pos: dict, reason: str) -> None:
+    """
+    Kısmi çıkış GERÇEKTEN gerçekleştiğinde çağrılır.
+
+    Ayrı bir fonksiyon çünkü `evaluate` yalnız KARAR üretir; kararın
+    gerçekleşip gerçekleşmediğini yalnız emri gönderen katman bilir.
+    """
+    if reason == EXIT_TP1:
+        pos["tp1_done"] = True
+        if BREAKEVEN_AFTER_TP1:
+            _tighten_stop(pos, _breakeven_price(pos), STOP_KIND_BREAKEVEN)
+    elif reason == EXIT_TP2:
+        pos["tp2_done"] = True
+        pos["trailing_active"] = True
+
+
 def _tighten_stop(pos: dict, new_stop: float, kind: str) -> bool:
     """
     Stop'u YALNIZCA lehte yönde taşı.
@@ -273,16 +289,16 @@ def evaluate(pos: dict, price: float, now: datetime | None = None) -> list[dict]
 
     # 4) Kısmi kâr alma
     if PARTIAL_EXITS_ENABLED:
+        # DENETİM BULGUSU: `tp1_done` ve stop taşıma, kısmi çıkış emri GERÇEKTEN
+        # dolmadan işaretleniyordu. Emir başarısız olursa: (a) bir daha asla
+        # denenmiyor, (b) stop yine de başabaşa taşınıyor — yani kâr realize
+        # edilmeden koruma gevşetiliyor. Artık işaretleme, emri UYGULAYAN
+        # katmanda (`ExitEngineMixin._apply_partial`) ve yalnız başarıda yapılır.
         if not pos["tp1_done"] and r_now >= PARTIAL_TP1_R:
-            pos["tp1_done"] = True
             actions.append({"type": "PARTIAL", "fraction": PARTIAL_TP1_PCT,
                             "reason": EXIT_TP1, "price": price})
-            if BREAKEVEN_AFTER_TP1:
-                _tighten_stop(pos, _breakeven_price(pos), STOP_KIND_BREAKEVEN)
 
         if pos["tp1_done"] and not pos["tp2_done"] and r_now >= PARTIAL_TP2_R:
-            pos["tp2_done"] = True
-            pos["trailing_active"] = True
             actions.append({"type": "PARTIAL", "fraction": PARTIAL_TP2_PCT,
                             "reason": EXIT_TP2, "price": price})
     else:

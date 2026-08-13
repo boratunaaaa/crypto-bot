@@ -38,7 +38,7 @@ from config import (
     RISK_PER_TRADE_PCT,
 )
 from risk_manager import calculate_leverage, calculate_position
-from position import new_position, evaluate, realized_r
+from position import new_position, evaluate, realized_r, confirm_partial
 from analyzer import _analyze_single
 
 # Funding 8 saatte bir, tipik oran. Gerçek geçmiş funding çekilmediğinde
@@ -196,6 +196,9 @@ def run_backtest(
                 actions = evaluate(pos, px, now=ts)
                 for act in actions:
                     if act["type"] == "PARTIAL":
+                        # Emir "gerçekleşti" sayıldıktan sonra durumu ilerlet;
+                        # aksi hâlde TP1 her barda yeniden tetiklenir.
+                        confirm_partial(pos, act["reason"])
                         qty_close = min(pos["initial_qty"] * act["fraction"], pos["qty"])
                         fill = _apply_slippage(px, pos["side"], is_entry=False)
                         gross = ((fill - pos["entry_price"]) if pos["side"] == "BUY"

@@ -12,6 +12,7 @@ import pytest
 
 import config
 from position import (
+    confirm_partial,
     new_position, evaluate,
     EXIT_INITIAL_STOP, EXIT_BREAKEVEN_STOP, EXIT_TRAIL_STOP,
     EXIT_TIME_STOP, EXIT_TP1, EXIT_TP2,
@@ -28,6 +29,15 @@ def make_pos(side="BUY", entry=100.0, stop=98.0, qty=10.0, atr_pct=0.01):
     )
 
 
+def _drive1(pos, *a, **kw):
+    """evaluate + kısmi çıkış onayı — gerçek akışın birebir karşılığı."""
+    acts = evaluate(pos, *a, **kw)
+    for x in acts:
+        if x["type"] == "PARTIAL":
+            confirm_partial(pos, x["reason"])
+    return acts
+
+
 def drive(pos, prices, start=None):
     """
     Fiyat serisini motora sırayla ver, aksiyonları topla.
@@ -40,6 +50,9 @@ def drive(pos, prices, start=None):
     acts = []
     for i, px in enumerate(prices):
         new_acts = evaluate(pos, px, now=now + timedelta(seconds=30 * i))
+        for a in new_acts:
+            if a["type"] == "PARTIAL":
+                confirm_partial(pos, a["reason"])   # emir gerçekleşti varsayımı
         acts.extend(new_acts)
         if any(a["type"] == "CLOSE" for a in new_acts):
             break
@@ -144,7 +157,7 @@ def test_trailing_never_widens_risk():
     stops = []
     now = datetime.now()
     for i, px in enumerate([100, 102, 105, 108, 106, 104, 109, 107]):
-        evaluate(pos, float(px), now=now + timedelta(seconds=30 * i))
+        _drive1(pos, float(px), now=now + timedelta(seconds=30 * i))
         stops.append(pos["stop_loss"])
     assert stops == sorted(stops), f"stop geriye gitti: {stops}"
 
@@ -175,7 +188,7 @@ def test_breakeven_stop_exit_is_labelled_separately():
 def test_time_stop_closes_stagnant_position():
     pos = make_pos()
     now = datetime.now()
-    evaluate(pos, 100.2, now=now)
+    _drive1(pos, 100.2, now=now)
     late = now + timedelta(minutes=config.TIME_STOP_MINUTES + 1)
     acts = evaluate(pos, 100.3, now=late)
     closes = [a for a in acts if a["type"] == "CLOSE"]
@@ -191,7 +204,7 @@ def test_time_stop_does_not_kill_a_running_winner():
     now = datetime.now()
     # Önce TP1'i geç (runner'a dönüşsün)
     for i, px in enumerate([100.0, 101.0, 102.0, 103.0]):
-        evaluate(pos, px, now=now + timedelta(seconds=30 * i))
+        _drive1(pos, px, now=now + timedelta(seconds=30 * i))
     assert pos["tp1_done"]
     # Çok sonra, hâlâ kârda
     late = now + timedelta(minutes=config.TIME_STOP_MAX_MINUTES + 60)

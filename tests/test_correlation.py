@@ -148,3 +148,17 @@ def test_guard_is_stricter_for_high_beta_symbols():
         max_net_r=3.0, max_stress_r=3.0, shock_pct=0.05,
     )
     assert ok_low and not ok_high
+
+
+def test_correlation_gate_respects_actual_risk_size():
+    """
+    DENETİM: kapı her adayı matematiksel olarak 1R sayıyordu; %0.4 riskli
+    işlemle %1.2 riskli işlem aynı maruziyeti üretiyordu. Risk birimi tek
+    olmalı — aksi hâlde portföy tavanı da bütçe iadesi de yanlış hesaplanır.
+    """
+    positions = {f"ALT{i}": _pos("BUY") for i in range(2)}
+    small, _ = can_add_correlated(positions, "C", "BUY", 0.4, {},
+                                  max_net_r=3.0, max_stress_r=3.0, shock_pct=0.05)
+    big, _ = can_add_correlated(positions, "C", "BUY", 1.6, {},
+                                max_net_r=3.0, max_stress_r=3.0, shock_pct=0.05)
+    assert small and not big, "küçük ve büyük riskli aday aynı muamele gördü"
