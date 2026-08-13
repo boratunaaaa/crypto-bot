@@ -177,8 +177,17 @@ class ExitEngineMixin:
     SIMULATE_FILLS = False
 
     def _apply_partial(self, pos, fraction, price, reason):
-        """Pozisyonun bir kısmını realize et; kalan koşmaya devam eder."""
-        qty_close = pos["initial_qty"] * fraction
+        """
+        Pozisyonun bir kısmını realize et; kalan koşmaya devam eder.
+
+        DENETİM BULGUSU: tekrar denemede hedefin TAMAMI yeniden gönderiliyordu.
+        İlk turda 0.4 istenip 0.1 dolduysa ikinci tur yine 0.4 gönderiyor ve
+        toplam 0.5 kapanıyordu — hedeflenen 0.4'ten fazlası. Kalan hesaba
+        katılmalı: 0.4 - 0.1 = 0.3.
+        """
+        done_key = f"_filled_{reason}"
+        target = pos["initial_qty"] * fraction
+        qty_close = target - pos.get(done_key, 0.0)
         qty_close = min(qty_close, pos["qty"])
         if qty_close <= 0:
             return
@@ -195,9 +204,7 @@ class ExitEngineMixin:
         # Kalan 0.3 bir daha DENENMİYORDU: kâr realize edilmeden koruma
         # gevşemiş oluyordu. TP hedefi ancak hedeflenen toplam miktar dolunca
         # tamamlanmış sayılır; eksik kalırsa sonraki tick tekrar dener.
-        done_key = f"_filled_{reason}"
         pos[done_key] = pos.get(done_key, 0.0) + filled
-        target = pos["initial_qty"] * fraction
         # Eksik kalan miktar borsada işlem görebilecek en küçük birimden
         # küçükse hedef tamamlanmış sayılır — lot adımı aşağı yuvarladığı için
         # her zaman bir adımlık artık kalır ve bu bir "başarısızlık" değildir.
@@ -460,24 +467,8 @@ class SpotTrader(ExitEngineMixin):
 
     @property
     def equity(self):
-        """
-        Gerçek futures equity — Binance'ten, yerel toplamayla DEĞİL.
-
-        DENETİM BULGUSU: `balance` Binance'in WALLET BALANCE'ı, yani bloke
-        teminatı ZATEN İÇERİYOR. Üstüne yerel marjinleri eklemek equity'yi
-        şişiriyordu; şişmiş equity daha büyük pozisyon boyutu ve olduğundan
-        küçük görünen bir drawdown üretir — ikisi de yanlış yönde.
-        Doğrusu: margin balance (= wallet + gerçekleşmemiş PnL).
-        """
-        try:
-            for b in self.client.futures_account_balance():
-                if b.get("asset") == "USDT":
-                    wallet = float(b.get("balance", 0.0))
-                    upnl = float(b.get("crossUnPnl", 0.0) or 0.0)
-                    return wallet + upnl
-        except Exception as e:
-            logger.warning(f"Equity okunamadı, yerel bakiyeye düşüldü: {e}")
-        return self.balance
+        """Spot: nakit + açık pozisyonların değeri (kaldıraç yok)."""
+        return self.balance + sum(p.get("margin", 0.0) for p in self.positions.values())
 
     def _symbol_filters(self, symbol):
         info  = self.client.get_symbol_info(symbol)
@@ -609,6 +600,9 @@ class FuturesTrader(ExitEngineMixin):
         # Borsa tarafında kapanan işlemler — main döngüsü bunları kill
         # switch'e işler ve listeyi tüketir.
         self.exchange_closed: list = []
+        # Akıbeti bilinmeyen emirler: symbol -> clientOrderId. Bu sembolde
+        # yeni emir GÖNDERİLMEZ; her turda akıbeti yeniden sorulur.
+        self.pending_unknown: dict[str, str] = {}
         self._load_step_cache()
 
     def _load_step_cache(self):
@@ -646,7 +640,24 @@ class FuturesTrader(ExitEngineMixin):
 
     @property
     def equity(self):
-        return self.balance + sum(p.get("margin", 0.0) for p in self.positions.values())
+        """
+        Gerçek futures equity — Binance'ten, yerel toplamayla DEĞİL.
+
+        DENETİM BULGUSU: `balance` Binance'in WALLET BALANCE'ı, yani bloke
+        teminatı ZATEN İÇERİYOR. Üstüne yerel marjinleri eklemek equity'yi
+        şişiriyordu; şişmiş equity daha büyük pozisyon boyutu ve olduğundan
+        küçük görünen bir drawdown üretir — ikisi de yanlış yönde.
+        Doğrusu: margin balance (= wallet + gerçekleşmemiş PnL).
+        """
+        try:
+            for b in self.client.futures_account_balance():
+                if b.get("asset") == "USDT":
+                    wallet = float(b.get("balance", 0.0))
+                    upnl = float(b.get("crossUnPnl", 0.0) or 0.0)
+                    return wallet + upnl
+        except Exception as e:
+            logger.warning(f"Equity okunamadı, yerel bakiyeye düşüldü: {e}")
+        return self.balance
 
     def transfer_spot_to_futures(self, amount: float) -> bool:
         try:
@@ -674,6 +685,22 @@ class FuturesTrader(ExitEngineMixin):
 
     def _execute(self, symbol: str, side: str, qty: float, *,
                  reduce_only: bool = False, purpose: str = "") -> "OrderResult":
+        # Akıbeti bilinmeyen bir emir varken bu sembolde YENİ EMİR YOK.
+        stale = self.pending_unknown.get(symbol)
+        if stale:
+            o = self._recover_order(symbol, stale)
+            if o is self.ORDER_ABSENT:
+                self.pending_unknown.pop(symbol, None)      # kesin olmamış
+            elif o is None:
+                logger.error(f"{symbol}: önceki emrin akıbeti hâlâ bilinmiyor — emir yok")
+                return OrderResult(0.0, 0.0, None, "UNKNOWN")
+            else:
+                self.pending_unknown.pop(symbol, None)
+                f, a = self._fill_of(o)
+                if f > 0:
+                    logger.warning(f"{symbol}: bekleyen emir aslında {f} dolmuş")
+                    return OrderResult(f, a, o.get("orderId"), "FILLED")
+
         step, min_q = self._get_step(symbol)
         q = _round_step(qty, step)
         if q < min_q:
@@ -690,15 +717,23 @@ class FuturesTrader(ExitEngineMixin):
         except Exception as e:
             # Emir gitmiş de olabilir — SORARIZ, tekrar göndermeyiz.
             o = self._recover_order(symbol, coid)
+            if o is self.ORDER_ABSENT:
+                logger.warning(f"Emir borsaya ulaşmamış {symbol} {purpose}: {e}")
+                return OrderResult(0.0, 0.0, None, "NONE")
             if o is None:
+                # BİLİNMİYOR: sembol karantinaya alınır. Bekleyen kimlik
+                # saklanmazsa bir sonraki tur aynı emri tekrar gönderebilir.
                 logger.error(f"Emir akıbeti bilinmiyor {symbol} {purpose}: "
                              f"{type(e).__name__}: {e}")
+                self.pending_unknown[symbol] = coid
                 return OrderResult(0.0, 0.0, None, "UNKNOWN")
 
         filled, avg = self._fill_of(o)
         if filled <= 0:
-            o = self._recover_order(symbol, coid) or o
-            filled, avg = self._fill_of(o)
+            probe = self._recover_order(symbol, coid)
+            if isinstance(probe, dict):
+                o = probe
+                filled, avg = self._fill_of(o)
 
         status = ("FILLED" if filled >= q * 0.999
                   else "PARTIAL" if filled > 0 else "NONE")
@@ -718,23 +753,32 @@ class FuturesTrader(ExitEngineMixin):
         stamp = int(datetime.now().timestamp() * 1000)
         return f"cb{stamp}{self._order_seq:03d}"[:36]
 
+    # Emir bulunamadı ile sorgulanamadı AYNI ŞEY DEĞİLDİR.
+    ORDER_ABSENT = "ABSENT"       # Binance açıkça "böyle bir emir yok" dedi
+
     def _recover_order(self, symbol: str, coid: str):
-        """Timeout/hata sonrası emrin gerçek akıbetini borsadan öğren."""
+        """
+        Emrin gerçek akıbeti.
+
+        Dönüş: emir sözlüğü | ORDER_ABSENT (kesin yok) | None (bilinmiyor)
+
+        DENETİM BULGUSU: ikisi de `None` dönüyordu. "Emir hiç oluşmadı" ile
+        "soramadım" karıştırılınca, bilinmeyen durumda emir yeniden
+        gönderilebiliyor — yani çift giriş veya fazla kısmi çıkış riski.
+        """
         try:
             return self.client.futures_get_order(symbol=symbol, origClientOrderId=coid)
-        except BinanceAPIException as e:
-            if getattr(e, "code", None) == -2013:     # emir hiç oluşmamış
-                return None
-            logger.warning(f"Emir sorgulanamadı {symbol} ({coid}): {e}")
-            return None
         except Exception as e:
+            if getattr(e, "code", None) == -2013:
+                return self.ORDER_ABSENT
             logger.warning(f"Emir sorgulanamadı {symbol} ({coid}): {e}")
             return None
 
     @staticmethod
     def _fill_of(order) -> tuple[float, float]:
         """(gerçekleşen miktar, ortalama fiyat) — ACK cevabında ikisi de 0'dır."""
-        if not order:
+        # `order` bir sözlük olmayabilir: ORDER_ABSENT işareti gelebilir.
+        if not isinstance(order, dict):
             return 0.0, 0.0
         try:
             return float(order.get("executedQty") or 0.0), float(order.get("avgPrice") or 0.0)
@@ -955,7 +999,10 @@ class FuturesTrader(ExitEngineMixin):
 
         # Yeni emir kurulamadı. Eskisi hâlâ duruyorsa pozisyon korumalı —
         # `_exchange_stop`'a DOKUNMUYORUZ ki bir sonraki tick yeniden denesin.
-        if old_id and self._verify_stop_exists(symbol, old_id):
+        # `None` = "sorgulayamadım". Onu "stop yok" saymak, var olan bir
+        # korumanın üstüne ikinci emir kurmak veya gereksiz acil kapama
+        # tetiklemek demektir. Bilinmiyorsa VAR kabul edilir (muhafazakâr).
+        if old_id and self._verify_stop_exists(symbol, old_id) is not False:
             logger.warning(
                 f"{symbol}: stop güncellenemedi, eski koruma ({last}) yerinde. "
                 f"Sonraki tick'te tekrar denenecek."
@@ -1094,46 +1141,24 @@ class FuturesTrader(ExitEngineMixin):
                     f"elle müdahale gerekiyor"
                 )
                 return False, "Kalan miktar minQty altında"
-            if True:
-                # DENETİM BULGUSU: kapanış emri gönderilip SONUCU HİÇ
-                # DOĞRULANMIYORDU. Timeout'ta veya kısmi dolumda Binance'de
-                # pozisyon açık kalırken bot onu kapanmış sayıp yerel kayıttan
-                # düşürüyordu — canlı pozisyon sahipsiz kalıyordu.
-                coid = self._client_order_id(symbol)
-                try:
-                    o = self.client.futures_create_order(
-                        symbol=symbol, side=close_side, type="MARKET",
-                        quantity=qty, reduceOnly=True,
-                        newClientOrderId=coid, newOrderRespType="RESULT",
-                    )
-                except Exception as oe:
-                    o = self._recover_order(symbol, coid)
-                    if o is None:
-                        self.positions[symbol] = pos      # geri koy, kaybetme
-                        logger.error(f"Kapama emrinin akıbeti bilinmiyor {symbol}: {oe}")
-                        return False, f"Kapama doğrulanamadı: {oe}"
-
-                filled, _ = self._fill_of(o)
-                remaining = self._position_amount(symbol)
-                # Tek geçerli kanıt: borsada pozisyon kalmamış olması.
-                if remaining != 0.0:
-                    self.positions[symbol] = pos
-                    self.unprotected[symbol] = (
-                        f"kapama tamamlanmadı (dolan {filled}, kalan {remaining})"
-                    )
-                    logger.error(
-                        f"{symbol}: kapama emri gönderildi ama pozisyon hâlâ açık "
-                        f"(dolan {filled}, kalan {remaining})"
-                    )
-                    return False, "Kapama tamamlanmadı"
-                self.unprotected.pop(symbol, None)
-                # PnL GERÇEKLEŞEN fiyattan hesaplanır; `price` yalnız kararı
-                # tetikleyen referanstı ve gerçek dolumdan sapabilir.
-                _, avg = self._fill_of(o)
-                if avg > 0:
-                    price = avg
-                if filled > 0:
-                    qty = filled
+            # Kapanış da TEK emir hattından geçer. Önceki turda bu yol
+            # kendi kurtarma kodunu çalıştırmaya devam ediyordu — yani
+            # "bütün emirler _execute üzerinden" iddiası doğru değildi.
+            res = self._execute(symbol, close_side, qty, reduce_only=True,
+                                purpose=f"kapama ({reason})")
+            remaining = self._position_amount(symbol)
+            if remaining != 0.0:
+                self.positions[symbol] = pos
+                self.unprotected[symbol] = (
+                    f"kapama tamamlanmadı (dolan {res.filled}, kalan {remaining})"
+                )
+                logger.error(f"{symbol}: kapama tamamlanmadı ({res.status})")
+                return False, "Kapama tamamlanmadı"
+            self.unprotected.pop(symbol, None)
+            if res.avg_price > 0:
+                price = res.avg_price          # PnL GERÇEK dolum fiyatından
+            if res.filled > 0:
+                qty = res.filled
             if pos.get("stop_order_id"):
                 # DENETİM: burada yalnız BinanceAPIException yakalanıyordu.
                 # Genel bir bağlantı timeout'u dışarı taşarsa pozisyon zaten
@@ -1266,7 +1291,13 @@ class FuturesTrader(ExitEngineMixin):
                 pos["qty"] = live[sym]["qty"]
 
             # Koruyucu stop hâlâ duruyor mu?
-            if self._verify_stop_exists(sym, pos.get("stop_order_id")):
+            state = self._verify_stop_exists(sym, pos.get("stop_order_id"))
+            if state is True:
+                continue
+            if state is None:
+                # Bilinmiyor: duplicate stop kurmak yerine şüpheli işaretle.
+                self.unprotected[sym] = "stop durumu doğrulanamadı (restart)"
+                logger.warning(f"RESTART: {sym} stop durumu bilinmiyor — şüpheli")
                 continue
             logger.warning(f"RESTART: {sym} koruyucu stop'u yok, yeniden kuruluyor")
             sl_side = "SELL" if pos["side"] == "BUY" else "BUY"
@@ -1436,8 +1467,13 @@ class FuturesTrader(ExitEngineMixin):
                     f"borsa {info['qty']}. Borsa esas alındı."
                 )
                 pos["qty"] = info["qty"]
-            if not self._verify_stop_exists(sym, pos.get("stop_order_id")):
+            state = self._verify_stop_exists(sym, pos.get("stop_order_id"))
+            if state is None:
+                logger.warning(f"SYNC: {sym} stop durumu doğrulanamadı — dokunulmuyor")
+                continue
+            if state is False:
                 logger.warning(f"SYNC: {sym} koruyucu stop kaybolmuş, yeniden kuruluyor")
+                sl_side = "SELL" if pos["side"] == "BUY" else "BUY"
                 sl_side = "SELL" if pos["side"] == "BUY" else "BUY"
                 new_id = self._place_stop(sym, sl_side, pos["stop_loss"])
                 if new_id is not None:

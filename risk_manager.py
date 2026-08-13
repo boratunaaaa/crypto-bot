@@ -140,6 +140,18 @@ class KillSwitchTracker:
 
     # ── Sorgular ──────────────────────────────────────────────────────────────
 
+    def observe_equity(self, equity: float) -> None:
+        """
+        Her turda çağrılır — tepe noktası AÇIK pozisyon kârıyla da ilerler.
+
+        DENETİM BULGUSU: `high_water_mark` yalnız işlem KAPANINCA
+        güncelleniyordu. Açık pozisyon +3R'ye çıkıp geri verirse o tepe hiç
+        kaydedilmiyor, dolayısıyla kill switch'in gördüğü drawdown gerçekten
+        yaşanandan küçük kalıyordu.
+        """
+        if equity > 0:
+            self.high_water_mark = max(self.high_water_mark, equity)
+
     def current_drawdown(self, balance: float) -> float:
         if self.high_water_mark <= 0:
             return 0.0

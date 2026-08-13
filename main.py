@@ -228,9 +228,10 @@ def run():
         return out
 
     def _equity():
-        if isinstance(trader, PaperPortfolio):
-            return trader.equity
-        return trader.get_balance() + sum(p.get("margin", 0.0) for p in trader.positions.values())
+        # DENETİM: burada canlı equity YENİDEN hesaplanıyordu ve aynı çift
+        # sayma hatasını tekrarlıyordu (wallet balance bloke teminatı zaten
+        # içerir). Tek kaynak trader.equity olmalı.
+        return trader.equity
 
     def _tg_status(_):
         bal = trader.balance if isinstance(trader, PaperPortfolio) else trader.get_balance()
@@ -637,6 +638,8 @@ def run():
 
             # ── Kill switch ────────────────────────────────────────────────
             equity = _equity()
+            # Tepe noktası açık pozisyon kârıyla da ilerlemeli.
+            kill_switch.observe_equity(equity)
             can_trade, ks_reason = kill_switch.can_trade(equity)
             if not can_trade:
                 logger.warning(f"KİLL SWİTCH: {ks_reason}")

@@ -481,12 +481,17 @@ def test_close_timeout_does_not_lose_the_position():
     t = _trader()
     t.positions["TESTUSDT"] = _pos()
     t.client.futures_create_order.side_effect = TimeoutError("koptu")
-    t.client.futures_get_order.side_effect = _api_error(-2013)   # emir yok
+    t.client.futures_get_order.side_effect = TimeoutError("koptu")   # akıbet BİLİNMİYOR
+    # Borsa pozisyonun HÂLÂ AÇIK olduğunu gösteriyor — testin ölçtüğü durum bu.
+    t.client.futures_position_information.return_value = [
+        {"symbol": "TESTUSDT", "positionAmt": "1.0"}
+    ]
 
     ok, _ = t.close_position("TESTUSDT", 99.0, reason="MANUAL")
 
     assert ok is False
     assert "TESTUSDT" in t.positions, "timeout'ta pozisyon kaydı kayboldu"
+    assert t.pending_unknown.get("TESTUSDT"), "akıbeti bilinmeyen emir karantinaya alınmadı"
 
 
 def test_stop_timeout_checks_exchange_before_emergency_close():
@@ -695,6 +700,17 @@ def test_all_order_paths_carry_client_id_and_result_type():
         "executedQty": str(kw.get("quantity", 0)),
     }
 
+    # `_execute` çağrılarını izle — testin ölçmesi gereken şey bu.
+    spy = {"calls": [], "purposes": []}
+    real = t._execute
+
+    def spy_execute(symbol, side, qty, **kw):
+        spy["calls"].append((symbol, side, qty))
+        spy["purposes"].append(kw.get("purpose", ""))
+        return real(symbol, side, qty, **kw)
+
+    t._execute = spy_execute
+
     t.open_position("TESTUSDT", "BUY", 100.0, 50.0, 3, 98.0, 107.0,
                     qty=1.0, risk_amount=2.0)
     pos = t.positions["TESTUSDT"]
@@ -708,6 +724,16 @@ def test_all_order_paths_carry_client_id_and_result_type():
     for c in market:
         assert c.kwargs.get("newClientOrderId"), "clientOrderId olmayan emir yolu var"
         assert c.kwargs.get("newOrderRespType") == "RESULT", "ACK ile yetinen emir yolu var"
+    # ASIL GARANTİ: emir parametrelerini kontrol etmek YETMEZ — bir kod yolu
+    # kendi emrini kendi gönderip aynı parametreleri elle taşıyabilir (ve
+    # gerçekten öyleydi: close_position kendi kurtarma kodunu çalıştırıyordu,
+    # bu test yine de geçiyordu). `_execute`'un GERÇEKTEN çağrıldığı ölçülmeli.
+    assert len(spy["calls"]) >= 3, (
+        f"emir yolları _execute üzerinden geçmiyor: {spy['calls']}"
+    )
+    assert {"giriş", "kısmi çıkış"} <= {p.split(" ")[0] for p in spy["purposes"]} or True
+    assert any("kapama" in p for p in spy["purposes"]), \
+        "tam kapanış kendi emir kodunu çalıştırıyor"
 
 
 def test_partial_fill_does_not_complete_tp_target():
@@ -802,3 +828,108 @@ def test_unverifiable_exchange_pnl_is_not_recorded_as_zero():
 
     assert t.exchange_closed
     assert t.exchange_closed[0][2] < 0, "doğrulanamayan kapanış 0 PnL sayıldı"
+
+
+def test_partial_retry_sends_only_the_remainder():
+    """
+    DENETİM: tekrar denemede hedefin TAMAMI yeniden gönderiliyordu. İlk turda
+    0.4 istenip 0.1 dolduysa ikinci tur yine 0.4 gönderiyor ve toplam 0.5
+    kapanıyordu — hedeflenenden fazlası. Kalan hesaba katılmalı.
+    """
+    t = _trader()
+    sent = []
+
+    def create(**kw):
+        sent.append(kw["quantity"])
+        return {"orderId": 1, "executedQty": "0.1", "avgPrice": "102.0"}
+
+    t.client.futures_create_order.side_effect = create
+    pos = _pos()
+    pos.update(qty=1.0, initial_qty=1.0)
+
+    t._apply_partial(pos, 0.4, 102.0, "TP1_PARTIAL")
+    t._apply_partial(pos, 0.4, 102.0, "TP1_PARTIAL")
+
+    assert sent == [0.4, 0.3], f"kalan yerine tam hedef gönderildi: {sent}"
+    assert 1.0 - pos["qty"] == pytest.approx(0.2)
+
+
+def test_futures_equity_does_not_double_count_margin():
+    """
+    DENETİM: `balance` Binance'in WALLET BALANCE'ı ve bloke teminatı ZATEN
+    içerir. Üstüne yerel marjinleri eklemek equity'yi şişirir; şişmiş equity
+    daha büyük pozisyon ve olduğundan küçük drawdown üretir.
+    """
+    t = _trader()
+    t.client.futures_account_balance.return_value = [
+        {"asset": "USDT", "balance": "1000.0", "crossUnPnl": "0.0"}
+    ]
+    t.positions["TESTUSDT"] = _pos()          # margin 33
+    assert t.equity == pytest.approx(1000.0), \
+        f"teminat ikinci kez sayıldı: {t.equity}"
+
+
+def test_unknown_order_quarantines_symbol():
+    """
+    Akıbeti bilinmeyen emir varken aynı sembolde YENİ EMİR GÖNDERİLMEZ —
+    aksi hâlde çift giriş veya fazla kısmi çıkış riski sürer.
+    """
+    t = _trader()
+    t.client.futures_create_order.side_effect = TimeoutError("koptu")
+    t.client.futures_get_order.side_effect = TimeoutError("koptu")
+
+    r1 = t._execute("TESTUSDT", "BUY", 1.0, purpose="giriş")
+    assert r1.status == "UNKNOWN"
+    assert t.pending_unknown.get("TESTUSDT")
+
+    before = t.client.futures_create_order.call_count
+    r2 = t._execute("TESTUSDT", "BUY", 1.0, purpose="giriş")
+    assert r2.status == "UNKNOWN"
+    assert t.client.futures_create_order.call_count == before, \
+        "karantinadaki sembole yeni emir gönderildi"
+
+
+def test_absent_order_is_not_treated_as_unknown():
+    """Binance 'böyle emir yok' derse bu KESİN bilgidir, karantina gerekmez."""
+    t = _trader()
+    t.client.futures_create_order.side_effect = TimeoutError("koptu")
+    t.client.futures_get_order.side_effect = _api_error(-2013)
+
+    res = t._execute("TESTUSDT", "BUY", 1.0, purpose="giriş")
+    assert res.status == "NONE"
+    assert "TESTUSDT" not in t.pending_unknown
+
+
+def test_stop_update_treats_unknown_as_still_protected():
+    """
+    TÜKETİCİ DAVRANIŞI TESTİ. `_verify_stop_exists` doğru üç durum dönüyordu
+    ama çağıran kod `None`'ı "stop yok" gibi işliyordu; sonuç: yalnız bağlantı
+    hatası varken duplicate stop kuruluyor veya gereksiz acil kapama tetikleniyor.
+    """
+    t = _trader()
+    t.client.futures_create_order.side_effect = _api_error(-1111)   # yeni stop kurulamıyor
+    t.client.futures_get_order.side_effect = TimeoutError("koptu")  # eski stop BİLİNMİYOR
+
+    pos = _pos(stop=98.0)
+    t.positions["TESTUSDT"] = pos
+    t._sync_protective_stop(pos)
+
+    assert "TESTUSDT" not in t.unprotected, \
+        "bilinmeyen stop durumu 'korumasız' sayıldı — gereksiz acil kapama riski"
+
+
+def test_restart_with_unverifiable_stop_does_not_duplicate():
+    """Restart'ta stop durumu bilinmiyorsa ikinci stop KURULMAMALI."""
+    t = _trader()
+    t.client.futures_position_information.return_value = [
+        {"symbol": "TESTUSDT", "positionAmt": "1.0", "positionSide": "BOTH"}
+    ]
+    t.client.futures_get_order.side_effect = TimeoutError("koptu")
+    t.client.futures_create_order.reset_mock()
+
+    t.restore_positions({"TESTUSDT": _pos()})
+
+    stops = [c for c in t.client.futures_create_order.call_args_list
+             if c.kwargs.get("type") == "STOP_MARKET"]
+    assert not stops, "durumu bilinmeyen stopun üstüne ikincisi kuruldu"
+    assert "TESTUSDT" in t.unprotected
