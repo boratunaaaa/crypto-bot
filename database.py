@@ -166,6 +166,9 @@ _TRADE_COLUMNS = [
     ("exit_detail",    "TEXT",    "''"),
     ("entry_snapshot", "TEXT",    "''"),
     ("funding_cost",   "REAL",    "0"),
+    # Kapanış PnL'i borsadan DOĞRULANDI mı. 0 = muhafazakâr tahmin kullanıldı.
+    # Go-live ölçümü tahminleri gerçek işlem gibi saymamalı.
+    ("pnl_verified",   "INTEGER", "1"),
 ]
 
 
@@ -212,7 +215,11 @@ def state_set(key: str, value) -> None:
         logger.error(f"state_set({key}) hatası: {e}")
 
 
-def state_get(key: str, default=None):
+def state_get(key: str, default=None, *, strict: bool = False):
+    """DENETİM BULGUSU: hata burada yutuluyor ve `default` dönüyordu. Çağıran
+    "kayıt yok" ile "okuyamadım"ı AYIRT EDEMİYORDU; karantina gibi kalıcılığa
+    bağlı korumalar bu yüzden sessizce hayalî hâle gelebiliyordu.
+    `strict=True` ile okuma hatası dışarı taşınır."""
     try:
         with _conn() as con:
             row = con.execute("SELECT value FROM bot_state WHERE key=?", (key,)).fetchone()
@@ -221,10 +228,18 @@ def state_get(key: str, default=None):
             return json.loads(row["value"])
     except Exception as e:
         logger.error(f"state_get({key}) hatası: {e}")
+        if strict:
+            raise
         return default
 
 
-def state_set_many(mapping: dict) -> None:
+def state_set_many(mapping: dict) -> bool:
+    """Dönüş: yazma BAŞARILI mı.
+
+    DENETİM BULGUSU: hata yutuluyor ve fonksiyon normal dönüyordu. Karantina
+    kaydı diske yazılamadığında çağıran bunu göremiyor, restart koruması
+    olmadığı hâlde varmış gibi davranıyordu.
+    """
     now = datetime.now().isoformat()
     try:
         with _conn() as con:
@@ -233,8 +248,10 @@ def state_set_many(mapping: dict) -> None:
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
                 [(k, json.dumps(v), now) for k, v in mapping.items()],
             )
+        return True
     except Exception as e:
         logger.error(f"state_set_many hatası: {e}")
+        return False
 
 
 def state_all() -> dict:
@@ -332,6 +349,7 @@ def save_trade(
     exit_detail:  str       = "",
     entry_snapshot: dict | None = None,
     funding_cost: float     = 0.0,
+    pnl_verified: bool      = True,
 ):
     duration = (close_time - open_time).total_seconds() / 60
     try:
@@ -343,8 +361,9 @@ def save_trade(
                  open_time, close_time, duration_min, score, btc_trend,
                  market_regime, atr_pct, fear_greed,
                  strategy, r_multiple, mae_r, mfe_r, risk_amount, initial_stop,
-                 partial_pnl, exit_detail, entry_snapshot, funding_cost, mode)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 partial_pnl, exit_detail, entry_snapshot, funding_cost, mode,
+                 pnl_verified)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 symbol, side, entry_price, close_price, margin, leverage,
                 gross_pnl, commission, net_pnl, reason_open, reason_close,
@@ -357,6 +376,7 @@ def save_trade(
                 # tüm satırlar varsayılan 'paper' kalıyordu. Go-live kapısı
                 # kâğıt ve canlı işlemleri ayırt edemezdi.
                 _mode(),
+                1 if pnl_verified else 0,
             ))
         _update_daily_stats(close_time.date(), net_pnl, commission, gross_pnl)
     except Exception as e:

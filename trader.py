@@ -74,7 +74,7 @@ def _load_pending_unknown() -> tuple[dict, bool]:
     yutuluyordu ve restart koruması sessizce kaybolabiliyordu.
     """
     try:
-        v = state_get("pending_unknown_orders")
+        v = state_get("pending_unknown_orders", strict=True)
     except Exception as e:
         logger.error(f"KARANTİNA OKUNAMADI — bekleyen emir olabilir: {e}")
         return {}, False
@@ -92,6 +92,20 @@ def _load_pending_unknown() -> tuple[dict, bool]:
             continue
         out[sym] = rec
     return out, ok
+
+
+def _load_reconcile() -> tuple[dict, bool]:
+    """Uzlaştırma bekleyen semboller — restart'ta geri yüklenir.
+
+    Dönüş: (kayıtlar, okuma_güvenilir_mi). Okuyamadıysak işlenmemiş bir dolum
+    olup olmadığını BİLMİYORUZ; karantina okumasıyla aynı mantık geçerli.
+    """
+    try:
+        v = state_get("reconcile_needed", strict=True)
+        return ({k: str(x) for k, x in v.items()} if isinstance(v, dict) else {}), True
+    except Exception as e:
+        logger.error(f"UZLAŞTIRMA LİSTESİ OKUNAMADI: {e}")
+        return {}, False
 
 
 # ── Yardımcılar ───────────────────────────────────────────────────────────────
@@ -439,7 +453,8 @@ class PaperPortfolio(ExitEngineMixin):
         self._persist_positions()
         return True, total_net
 
-    def _record_trade(self, pos, price, reason, gross, comm, net):
+    def _record_trade(self, pos, price, reason, gross, comm, net,
+                      pnl_verified: bool = True):
         summary = position_summary(pos)
         try:
             save_trade(
@@ -466,6 +481,11 @@ class PaperPortfolio(ExitEngineMixin):
                     f"stop_kind={pos.get('stop_kind')}"
                 ),
                 entry_snapshot=pos.get("entry_snapshot", {}),
+                # DENETİM BULGUSU: muhafazakâr TAHMİN kullanılan kapanışlar
+                # DB'ye normal satır olarak yazılıyordu. Go-live kapısı bütün
+                # satırları ayrımsız örnekleme kattığı için tahminler 200 işlem
+                # hedefini, profit factor'ü ve beklentiyi etkiliyordu.
+                pnl_verified=pnl_verified,
             )
         except Exception as e:
             logger.error(f"Trade kaydedilemedi: {e}")
@@ -676,7 +696,9 @@ class FuturesTrader(ExitEngineMixin):
         self.pending_unknown, self.pending_state_ok = _load_pending_unknown()
         # Borsada gerçekleşmiş ama yerel kayda işlenmemiş dolumlar. Kayıt ile
         # borsa ayrıştığı için pozisyon boyutu güvenilmez → İŞLEM DURUR.
-        self.reconcile_needed: dict[str, str] = {}
+        self.reconcile_needed, _rec_ok = _load_reconcile()
+        if not _rec_ok:
+            self.pending_state_ok = False
         # Kapanış PnL'i doğrulanamayan işlemler. Bunlar işlemi DURDURMAZ:
         # muhafazakâr değer zaten kill switch'e gidiyor, üstüne bir de kalıcı
         # duruş koymak geçici bir sorgu hatasını tam kesintiye çevirirdi.
@@ -782,7 +804,7 @@ class FuturesTrader(ExitEngineMixin):
     TERMINAL_STATUS = ("FILLED", "CANCELED", "EXPIRED", "REJECTED")
 
     def _matches_pending(self, rec: dict, symbol: str, side: str,
-                         q: float, reduce_only: bool) -> bool:
+                         q: float, reduce_only: bool, purpose: str = "") -> bool:
         """Karantinadaki emir, ŞU ANKİ çağrının emri mi?
 
         Eşleşme yoksa o emrin dolumu bu çağrının sonucu SAYILAMAZ.
@@ -791,6 +813,13 @@ class FuturesTrader(ExitEngineMixin):
             return False
         if bool(rec.get("reduce_only")) != bool(reduce_only):
             return False
+        # DENETİM BULGUSU: `purpose` kaydediliyor ama eşleştirmede
+        # KULLANILMIYORDU. Eski bir "kapama" emri, sonraki "kısmi çıkış"
+        # çağrısına sahiplenilebiliyordu: ikisi de aynı yön ve reduceOnly,
+        # miktar da çakışabilir. Fazla katı olması güvenlidir — eşleşmezse
+        # emir sahiplenilmez, dolum varsa uzlaştırmaya düşer.
+        if (rec.get("purpose") or "") != (purpose or ""):
+            return False
         want = float(rec.get("qty") or 0.0)
         if want <= 0:
             return False                       # bağlamsız eski kayıt
@@ -798,7 +827,7 @@ class FuturesTrader(ExitEngineMixin):
         return abs(want - q) <= max(step, want * 0.01)
 
     def _reconcile_pending(self, symbol: str, side: str, q: float,
-                           reduce_only: bool):
+                           reduce_only: bool, purpose: str = ""):
         """Bekleyen emri çöz. Dönüş: (yeni_emre_devam_edilebilir, sonuç)."""
         raw = self.pending_unknown.get(symbol)
         if not raw:
@@ -833,27 +862,35 @@ class FuturesTrader(ExitEngineMixin):
             logger.error(f"{symbol}: bekleyen emir hâlâ {st} — yeni emir yok")
             return False, OrderResult(f, a, o.get("orderId"), "UNKNOWN")
 
+        matched = self._matches_pending(rec, symbol, side, q, reduce_only, purpose)
+
+        # Eşleşmiyor ve dolum var: bu dolum BAŞKA bir operasyona ait. Bu
+        # çağrının sonucu olarak döndürmek, bir işlemin dolumunu başka işleme
+        # yazmak olurdu.
+        if not matched and f > 0:
+            note = (f"{rec.get('side')} {f} @{a} "
+                    f"({rec.get('purpose') or 'bağlamsız kayıt'}) dolmuş, "
+                    f"yerel kayda işlenmedi")
+            self.reconcile_needed[symbol] = note
+            logger.error(f"{symbol}: UZLAŞTIRMA GEREKİYOR — {note}")
+            # SIRA ÖNEMLİ: uzlaştırma kalıcı YAZILMADAN karantina silinmez.
+            # Aksi hâlde ikisinin arasındaki çökme, restart sonrasında ne
+            # bekleyen kayıt ne uzlaştırma notu ne de işlem yasağı bırakır.
+            if self._save_reconcile():
+                self.pending_unknown.pop(symbol, None)
+                self._save_pending()
+            else:
+                logger.error(f"{symbol}: uzlaştırma yazılamadı — karantina KORUNUYOR")
+            return False, OrderResult(0.0, 0.0, None, "UNKNOWN")
+
         self.pending_unknown.pop(symbol, None)
         self._save_pending()
 
-        if self._matches_pending(rec, symbol, side, q, reduce_only):
-            if f > 0:
-                logger.warning(f"{symbol}: bekleyen emir aslında {f} dolmuş ({st})")
-                return False, OrderResult(
-                    f, a, o.get("orderId"),
-                    "FILLED" if f >= q * 0.999 else "PARTIAL")
-            return True, None                      # hiç dolmamış → tekrar gönderilebilir
-
-        # Eşleşmiyor: dolum BAŞKA bir operasyona ait. Bu çağrının sonucu
-        # olarak döndürmek, bir işlemin dolumunu başka işleme yazmak olurdu.
-        if f > 0:
-            self.reconcile_needed[symbol] = (
-                f"{rec.get('side')} {f} @{a} "
-                f"({rec.get('purpose') or 'bağlamsız kayıt'}) dolmuş, "
-                f"yerel kayda işlenmedi"
-            )
-            logger.error(f"{symbol}: UZLAŞTIRMA GEREKİYOR — {self.reconcile_needed[symbol]}")
-            return False, OrderResult(0.0, 0.0, None, "UNKNOWN")
+        if matched and f > 0:
+            logger.warning(f"{symbol}: bekleyen emir aslında {f} dolmuş ({st})")
+            return False, OrderResult(
+                f, a, o.get("orderId"),
+                "FILLED" if f >= q * 0.999 else "PARTIAL")
         return True, None
 
     # MARKET emrinin oturması için bekleme. Kısa ve sınırlı: emir terminal
@@ -888,7 +925,7 @@ class FuturesTrader(ExitEngineMixin):
         q = _round_step(qty, step)
 
         # Akıbeti bilinmeyen bir emir varken bu sembolde YENİ EMİR YOK.
-        proceed, result = self._reconcile_pending(symbol, side, q, reduce_only)
+        proceed, result = self._reconcile_pending(symbol, side, q, reduce_only, purpose)
         if not proceed:
             return result
 
@@ -952,14 +989,41 @@ class FuturesTrader(ExitEngineMixin):
                            o.get("orderId") if isinstance(o, dict) else None, status)
 
     def _save_pending(self) -> None:
+        # DENETİM BULGUSU: `state_set_many` hatayı KENDİ İÇİNDE yutup normal
+        # dönüyordu; buradaki try/except hiçbir zaman tetiklenmiyordu, yani
+        # "yazma hatası yakalanıyor" koruması gerçekte çalışmıyordu. Artık
+        # yazma sonucu dönüş değerinden okunuyor.
+        ok = False
         try:
-            state_set_many({"pending_unknown_orders": self.pending_unknown})
-            self.pending_state_ok = True
+            ok = bool(state_set_many({"pending_unknown_orders": self.pending_unknown}))
         except Exception as e:
-            # DENETİM BULGUSU: bu hata yutuluyordu. Kayıt diske yazılamazsa
-            # restart koruması yoktur; sessiz kalmak o korumayı hayalî yapar.
-            self.pending_state_ok = False
             logger.error(f"KARANTİNA KAYDEDİLEMEDİ {self.pending_unknown}: {e}")
+        if not ok:
+            self.pending_state_ok = False
+            logger.error(f"KARANTİNA DİSKE YAZILAMADI {self.pending_unknown} — "
+                         f"restart koruması yok, yeni giriş durdu")
+        else:
+            self.pending_state_ok = True
+
+    def _save_reconcile(self) -> bool:
+        """Uzlaştırma listesini diske yaz.
+
+        DENETİM BULGUSU: yalnız bellekteydi. Yabancı dolum bulunduğunda önce
+        karantina siliniyor, sonra sorun belleğe yazılıyordu; tam o aralıkta
+        çökme olursa restart sonrası ne bekleyen kayıt, ne uzlaştırma notu,
+        ne de işlem yasağı kalıyordu — yani borsada işlenmemiş bir dolum
+        varken bot hiçbir şey olmamış gibi işleme devam ediyordu.
+        """
+        try:
+            if state_set_many({"reconcile_needed": self.reconcile_needed}):
+                return True
+        except Exception as e:
+            logger.error(f"UZLAŞTIRMA KAYDI YAZILAMADI {self.reconcile_needed}: {e}")
+        # Kalıcı yazamıyorsak karantinayı da SİLMEYİZ: en azından bekleyen
+        # kayıt üzerinden koruma devam eder.
+        self.pending_state_ok = False
+        logger.error(f"UZLAŞTIRMA KAYDI YAZILAMADI {self.reconcile_needed}")
+        return False
 
     def _client_order_id(self, symbol: str) -> str:
         """
@@ -1689,6 +1753,7 @@ class FuturesTrader(ExitEngineMixin):
                     self._record_trade(
                         pos, close_px, "EXCHANGE_STOP",
                         total_net + comm, comm, total_net,
+                        pnl_verified=pnl_verified,
                     )
 
             if binance_open != set(self.positions):

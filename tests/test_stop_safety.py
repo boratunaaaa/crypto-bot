@@ -15,6 +15,7 @@ Denetimde bulunan açıklar (2026-08-13):
      1 numaralı açığı tetikleyen en olası sebepti.
 """
 
+import sqlite3
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1241,18 +1242,20 @@ def test_zero_qty_record_never_matches_a_tiny_order():
 
 def test_quarantine_read_failure_is_reported():
     """
-    DENETİM BULGUSU: okuma hatası yutuluyordu. Karantinayı okuyamadıysak
-    bekleyen emir olup olmadığını BİLMİYORUZ; "temiz" rapor etmek, restart
-    korumasını sessizce ortadan kaldırır.
+    DENETİM BULGUSU (2): ilk yazdığım test `trader.state_get`'i yamalıyordu,
+    yani ÜRETİM yolunu hiç ölçmüyordu. Gerçekte `state_get` hatayı KENDİ
+    İÇİNDE yutup `default` dönüyordu; okuma patlasa bile pending_state_ok
+    True kalıyordu. Test artık gerçek DB katmanını bozarak ölçüyor.
     """
     import trader as tr
-    with patch("trader.state_get", side_effect=RuntimeError("DB kilitli")):
+    import database
+    with patch.object(database, "_conn", side_effect=sqlite3.OperationalError("DB kilitli")):
         recs, ok = tr._load_pending_unknown()
-    assert ok is False, "okuma hatası 'durum temiz' olarak raporlandı"
+    assert ok is False, "gerçek DB okuma hatası 'durum temiz' olarak raporlandı"
 
     # Bozuk tipte kayıt da güvenilir sayılmamalı.
-    with patch("trader.state_get", return_value="beklenmeyen"):
-        _, ok2 = tr._load_pending_unknown()
+    database.state_set("pending_unknown_orders", "beklenmeyen")
+    _, ok2 = tr._load_pending_unknown()
     assert ok2 is False
 
 
@@ -1366,13 +1369,37 @@ def test_unreadable_quarantine_state_blocks_new_entries():
 
 
 def test_quarantine_save_failure_is_surfaced():
-    """Yazma başarısızsa restart koruması yoktur; sessiz kalmak onu hayalî yapar."""
+    """
+    Yazma başarısızsa restart koruması yoktur; sessiz kalmak onu hayalî yapar.
+
+    DENETİM BULGUSU (2): `state_set_many` hatayı kendi içinde yutup normal
+    dönüyordu, dolayısıyla trader'daki try/except hiç tetiklenmiyordu. Test
+    gerçek DB katmanını bozar; koruma dönüş değerinden okunmalı.
+    """
+    import database
     t = _trader()
-    with patch("trader.state_set_many", side_effect=RuntimeError("DB kilitli")):
-        t.pending_unknown["TESTUSDT"] = {"coid": "x", "side": "BUY", "qty": 1.0,
-                                         "reduce_only": False, "purpose": "", "ts": 0}
+    t.pending_unknown["TESTUSDT"] = {"coid": "x", "side": "BUY", "qty": 1.0,
+                                     "reduce_only": False, "purpose": "", "ts": 0}
+    with patch.object(database, "_conn", side_effect=sqlite3.OperationalError("DB kilitli")):
         t._save_pending()
-    assert t.pending_state_ok is False, "kayıt hatası yutuldu"
+    assert t.pending_state_ok is False, "gerçek DB yazma hatası yutuldu"
+
+    # Ve bu, yeni girişi gerçekten durdurmalı.
+    ok, msg = t.open_position("TESTUSDT", "BUY", 100.0, 50.0, 3, 98.0, 107.0,
+                              qty=1.0, risk_amount=2.0)
+    assert ok is False and "Karantina" in msg
+
+
+def test_state_layer_reports_failure_to_caller():
+    """DB sarmalayıcıları hatayı çağırana BİLDİRMELİ — yutmamalı."""
+    import database
+    with patch.object(database, "_conn", side_effect=sqlite3.OperationalError("bozuk")):
+        assert database.state_set_many({"k": 1}) is False
+        with pytest.raises(sqlite3.OperationalError):
+            database.state_get("k", strict=True)
+        # strict=False eski davranışı korur (diğer çağıranlar bozulmasın)
+        assert database.state_get("k", default="X") == "X"
+    assert database.state_set_many({"k": 1}) is True
 
 
 def test_unknown_fill_is_not_treated_as_settled():
@@ -1435,3 +1462,190 @@ def test_settle_wait_is_bounded():
     assert res.status == "UNKNOWN"
     assert t.client.futures_get_order.call_count == t.SETTLE_ATTEMPTS
     assert t.pending_unknown.get("TESTUSDT")
+
+
+def test_purpose_participates_in_matching():
+    """
+    DENETİM BULGUSU: `purpose` kaydediliyor ama eşleştirmede KULLANILMIYORDU.
+    Eski bir "kapama" emri, sonraki "kısmi çıkış" çağrısına FILLED olarak
+    sahiplenilebiliyordu — ikisi de SELL/reduceOnly ve miktar çakışabilir.
+    """
+    t = _trader()
+    t.pending_unknown["TESTUSDT"] = {
+        "coid": "cb-tam-kapama", "side": "SELL", "qty": 1.0,
+        "reduce_only": True, "purpose": "kapama (MANUAL)", "ts": 0,
+    }
+    t.client.futures_get_order.return_value = {
+        "orderId": 3, "status": "FILLED", "executedQty": "1.0", "avgPrice": "99.0",
+    }
+    res = t._execute("TESTUSDT", "SELL", 1.0, reduce_only=True,
+                     purpose="kısmi çıkış")
+    assert res.status == "UNKNOWN" and res.filled == 0.0, \
+        "tam kapama emrinin dolumu kısmi çıkışa sahiplenildi"
+    assert "TESTUSDT" in t.reconcile_needed
+
+
+def test_reconcile_state_survives_restart():
+    """
+    DENETİM BULGUSU: yabancı dolum bulununca önce karantina siliniyor, sonra
+    sorun YALNIZ BELLEĞE yazılıyordu. Tam o aralıkta çökme olursa restart'ta
+    ne bekleyen kayıt, ne uzlaştırma notu, ne de işlem yasağı kalıyordu.
+    """
+    import trader as tr
+    t = _trader()
+    t.pending_unknown["TESTUSDT"] = {
+        "coid": "cb-yabanci", "side": "SELL", "qty": 1.0,
+        "reduce_only": True, "purpose": "kapama", "ts": 0,
+    }
+    t.client.futures_get_order.return_value = {
+        "orderId": 3, "status": "FILLED", "executedQty": "1.0", "avgPrice": "99.0",
+    }
+    t._execute("TESTUSDT", "BUY", 1.0, purpose="giriş")
+    assert "TESTUSDT" in t.reconcile_needed
+
+    # Restart: yeni nesne, aynı DB.
+    saved, ok = tr._load_reconcile()
+    assert ok and saved.get("TESTUSDT"), "uzlaştırma diske yazılmadı"
+    t2 = _trader()
+    assert "TESTUSDT" in t2.reconcile_needed, "restart sonrası işlem yasağı kayboldu"
+
+
+def test_quarantine_kept_when_reconcile_cannot_be_persisted():
+    """Uzlaştırma kalıcı yazılamıyorsa karantina SİLİNMEZ — tek koruma odur."""
+    import database
+    t = _trader()
+    rec = {"coid": "cb-yabanci", "side": "SELL", "qty": 1.0,
+           "reduce_only": True, "purpose": "kapama", "ts": 0}
+    t.pending_unknown["TESTUSDT"] = rec
+    t.client.futures_get_order.return_value = {
+        "orderId": 3, "status": "FILLED", "executedQty": "1.0", "avgPrice": "99.0",
+    }
+    with patch.object(database, "_conn", side_effect=sqlite3.OperationalError("bozuk")):
+        res = t._execute("TESTUSDT", "BUY", 1.0, purpose="giriş")
+    assert res.status == "UNKNOWN"
+    assert t.pending_unknown.get("TESTUSDT"), \
+        "uzlaştırma yazılamadığı hâlde karantina silindi — koruma tamamen kalktı"
+
+
+def test_unverified_pnl_is_excluded_from_go_live_sample():
+    """
+    DENETİM BULGUSU: muhafazakâr TAHMİN kullanılan kapanışlar DB'ye normal
+    satır olarak yazılıyordu ve go-live kapısı hepsini ayrımsız örnekleme
+    katıyordu. Tahminler 200 işlem hedefini ve profit factor'ü etkiliyordu.
+    """
+    import datetime as dt
+    import database
+    import go_live_check as glc
+
+    base = dict(
+        symbol="TESTUSDT", side="BUY", entry_price=100.0, close_price=101.0,
+        margin=33.0, leverage=3, gross_pnl=1.0, commission=0.1, net_pnl=0.9,
+        reason_open="t", reason_close="TP",
+        open_time=dt.datetime(2026, 8, 13, 10, 0),
+        close_time=dt.datetime(2026, 8, 13, 12, 0),
+    )
+    database.save_trade(**base, pnl_verified=True)
+    database.save_trade(**{**base, "net_pnl": -5.0}, pnl_verified=False)
+
+    rows = database._rows if hasattr(database, "_rows") else None
+    with patch.object(glc, "REFACTOR_CUTOFF", "2026-01-01"):
+        _, results = glc.check()
+
+    sample = next(r for r in results if r[0] == "Örneklem büyüklüğü")
+    assert "1 işlem" in sample[2], f"doğrulanmamış işlem örnekleme katıldı: {sample[2]}"
+    assert "doğrulanmamış" in sample[2], "dışlanan işlem raporlanmadı"
+
+
+def test_unverified_close_is_persisted_as_unverified():
+    """Bayrak yalnız bellekte kalırsa go-live kapısı onu göremez."""
+    import database
+    t = _trader()
+    t.positions["TESTUSDT"] = _pos()
+    t.client.futures_position_information.return_value = []
+    t.client.futures_symbol_ticker.return_value = {"price": "101.0"}
+
+    def income(**kw):
+        if kw.get("incomeType") == "REALIZED_PNL":
+            return [{"income": "10.0"}]
+        raise TimeoutError("okunamadı")
+
+    t.client.futures_income_history.side_effect = income
+    t.sync_positions()
+
+    with database._conn() as con:
+        rows = [dict(r) for r in con.execute("SELECT pnl_verified FROM trades")]
+    assert rows, "işlem hiç kaydedilmedi"
+    assert rows[-1]["pnl_verified"] == 0, "doğrulanmamış kapanış DB'de doğrulanmış yazıldı"
+
+
+def test_unreadable_reconcile_state_blocks_new_entries():
+    """
+    Uzlaştırma listesi okunamıyorsa borsada işlenmemiş bir dolum olup
+    olmadığını bilmiyoruz — karantina okumasıyla aynı mantık.
+    """
+    import database
+    with patch.object(database, "_conn", side_effect=sqlite3.OperationalError("bozuk")):
+        _, ok = __import__("trader")._load_reconcile()
+    assert ok is False
+
+
+def test_reduce_only_checked_even_when_purpose_matches():
+    """
+    MUTASYON BULGUSU: reduceOnly kontrolünü bozan mutasyon testlerden sağ
+    çıkıyordu, çünkü yazdığım testlerde `purpose` de farklıydı ve o yakalıyordu.
+    Kontrolün kendisini ölçmek için purpose AYNI, reduceOnly FARKLI olmalı.
+    """
+    t = _trader()
+    t.pending_unknown["TESTUSDT"] = {
+        "coid": "cb-1", "side": "SELL", "qty": 1.0,
+        "reduce_only": True, "purpose": "elle işlem", "ts": 0,
+    }
+    t.client.futures_get_order.return_value = {
+        "orderId": 3, "status": "FILLED", "executedQty": "1.0", "avgPrice": "99.0",
+    }
+    res = t._execute("TESTUSDT", "SELL", 1.0, reduce_only=False, purpose="elle işlem")
+    assert res.filled == 0.0 and res.status == "UNKNOWN", \
+        "reduceOnly farkı görmezden gelindi"
+
+
+def test_zero_qty_record_never_matches_even_with_same_purpose():
+    """
+    MUTASYON BULGUSU: `want <= 0` guard'ını bozan mutasyon sağ çıkıyordu,
+    çünkü testte purpose farklıydı. Guard'ın kendisi şu durumda yükte:
+    miktar bilinmiyorken |0 - 0.001| <= max(step, 0) sağlanır ve lot adımı
+    kadar küçük bir emir YANLIŞLIKLA sahiplenilir.
+    """
+    t = _trader()                     # stepSize = 0.001
+    t.pending_unknown["TESTUSDT"] = {
+        "coid": "cb-bos", "side": "BUY", "qty": 0.0,
+        "reduce_only": False, "purpose": "giriş", "ts": 0,
+    }
+    t.client.futures_get_order.return_value = {
+        "orderId": 3, "status": "FILLED", "executedQty": "0.001", "avgPrice": "99.0",
+    }
+    res = t._execute("TESTUSDT", "BUY", 0.001, purpose="giriş")
+    assert res.filled == 0.0, "miktarı bilinmeyen kayıt küçük emirle eşleşti"
+
+
+def test_corrupt_reconcile_state_blocks_new_entries_at_startup():
+    """
+    Uzlaştırma kaydı bozuksa (JSON çözülemiyorsa) borsada işlenmemiş bir dolum
+    olup olmadığını BİLMİYORUZ. Karantina kaydı sağlam olsa bile yeni giriş
+    açılmamalı — bu, gerçekten olabilecek bir bozulma senaryosudur.
+    """
+    import database
+    # Karantina anahtarı SAĞLAM, uzlaştırma anahtarı BOZUK.
+    database.state_set("pending_unknown_orders", {})
+    with database._conn() as con:
+        con.execute(
+            "INSERT INTO bot_state (key, value, updated_at) VALUES (?,?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            ("reconcile_needed", "{bozuk json", "2026-08-13"),
+        )
+
+    t = _trader()
+    assert t.pending_state_ok is False, \
+        "uzlaştırma kaydı okunamadığı hâlde durum 'temiz' sayıldı"
+    ok, msg = t.open_position("TESTUSDT", "BUY", 100.0, 50.0, 3, 98.0, 107.0,
+                              qty=1.0, risk_amount=2.0)
+    assert ok is False and "Karantina" in msg

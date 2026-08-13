@@ -124,19 +124,28 @@ def _rows(sql, params=()):
 def check() -> tuple[bool, list[tuple[str, bool, str]]]:
     results: list[tuple[str, bool, str]] = []
 
-    trades = _rows(
+    all_rows = _rows(
         "SELECT * FROM trades WHERE close_time >= ? ORDER BY close_time",
         (REFACTOR_CUTOFF,),
     )
+    # DENETİM BULGUSU: bütün satırlar ayrımsız örnekleme katılıyordu. Kapanış
+    # PnL'i borsadan doğrulanamayan işlemlerde MUHAFAZAKÂR TAHMİN yazılır;
+    # bunları gerçek ölçüm gibi saymak hem 200 işlem hedefini şişirir hem de
+    # profit factor / beklentiyi uydurma sayılarla kirletir. Gerçek paraya
+    # geçiş kararı yalnız DOĞRULANMIŞ işlemlere dayanmalıdır.
+    def _verified(t):
+        v = t.get("pnl_verified")
+        return v is None or int(v) == 1        # eski satırlarda kolon yok
+    trades = [t for t in all_rows if _verified(t)]
+    unverified = len(all_rows) - len(trades)
     n = len(trades)
 
     # 1) Örneklem büyüklüğü
     ok = n >= GATES["min_trades"]
-    results.append((
-        "Örneklem büyüklüğü",
-        ok,
-        f"{n} işlem (gereken: {GATES['min_trades']}) — refactor sonrası",
-    ))
+    detail = f"{n} işlem (gereken: {GATES['min_trades']}) — refactor sonrası"
+    if unverified:
+        detail += f"; {unverified} doğrulanmamış işlem örnekleme KATILMADI"
+    results.append(("Örneklem büyüklüğü", ok, detail))
 
     if n == 0:
         results.append(("Diğer kapılar", False, "Değerlendirilecek işlem yok"))
