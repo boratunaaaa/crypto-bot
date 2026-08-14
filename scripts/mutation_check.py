@@ -75,9 +75,9 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
      'if (rec.get("purpose") or "") != (purpose or ""):\n            return False',
      'if False:\n            return False'),
 
-    ("M3", "trader.py", "PnL doğrulama bayrağı hiç düşmez",
-     'pnl_verified = False\n                                logger.error(f"SYNC: {sym} {kind} okunamadı: {ie}")',
-     'logger.error(f"SYNC: {sym} {kind} okunamadı: {ie}")'),
+    ("M3", "trader.py", "Borsa-stop ortak PnL doğrulayıcısını atlar",
+     'measured_net, pnl_verified = self._exchange_net_pnl(sym, since)',
+     'measured_net, pnl_verified = 0.0, True'),
 
     ("M4", "trader.py", "Equity crossUnPnl yedek yoluna düşer",
      'self.equity_stale = True\n            logger.error(f"Equity ölçülemedi — yeni giriş durduruldu: {e}")',
@@ -116,8 +116,8 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
      'if False:\n            return False, "Karantina durumu okunamıyor, yeni pozisyon açılmıyor"'),
 
     ("M12", "trader.py", "Doğrulanmamış PnL'de iyimser değer kullanılır",
-     'total_net = min(pnl, est)',
-     'total_net = pnl'),
+     'total_net = min(measured_net, est_total)',
+     'total_net = measured_net'),
 
     ("M13", "trader.py", "ORDER_ABSENT karantinaya alınır",
      'return o, filled, avg, True\n            # None: sorgulayamadık',
@@ -232,12 +232,57 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
      'return True'),
 
     ("M40", "database.py", "Doğrulanmamış kâr risk hesabına girer",
-     'out.append(pnl if (r["v"] or pnl < 0) else 0.0)',
-     'out.append(pnl)'),
+     '"WHERE COALESCE(pnl_verified, 0) = 1 OR net_pnl < 0 "',
+     '"WHERE 1 = 1 "'),
 
     ("M41", "database.py", "Doğrulanmamış işlem günlük raporda işaretlenmez",
      '(row["unverified"] or 0) + (0 if verified else 1),',
      '(row["unverified"] or 0),'),
+
+    # ── 11. tur ──
+    ("M42", "trader.py", "Pozisyon senkronu bilinmezken giriş serbest",
+     'if not self.position_sync_ok:\n            return False, "Borsa pozisyon durumu doğrulanamıyor, yeni pozisyon açılmıyor"',
+     'if False:\n            return False, "Borsa pozisyon durumu doğrulanamıyor, yeni pozisyon açılmıyor"'),
+
+    ("M43", "trader.py", "Pozisyon API hatası senkron kilidini düşürmez",
+     'self.position_sync_ok = False\n            for sym in self.positions:',
+     'self.position_sync_ok = True\n            for sym in self.positions:'),
+
+    ("M44", "trader.py", "Başarılı senkron giriş kilidini açmaz",
+     'self.position_sync_ok = True\n            return binance_open',
+     'return binance_open'),
+
+    ("M45", "trader.py", "Stop doğrulama belirsizliği girişe engel olmaz",
+     'if self.protection_unknown:\n            return False, (f"Stop koruması doğrulanamayan pozisyon var "',
+     'if False:\n            return False, (f"Stop koruması doğrulanamayan pozisyon var "'),
+
+    ("M46", "trader.py", "Okunamayan stop belirsizlik listesine yazılmaz",
+     'self.protection_unknown[sym] = "koruyucu stop durumu okunamıyor"',
+     '_ignored_protection_unknown = sym'),
+
+    ("M47", "trader.py", "Giriş sonrası acil kapanış muhasebe yolunu atlar",
+     'self._mark_unprotected(pos, "giriş sonrası koruyucu stop kurulamadı")',
+     'self.positions.pop(symbol, None)'),
+
+    ("M48", "trader.py", "Borsa-stop kısmi PnL'i ikinci kez sayar",
+     'self.total_pnl += total_net - pos.get("realized_pnl", 0.0)',
+     'self.total_pnl += total_net'),
+
+    ("M49", "database.py", "Profit factor yalnız son zararı kullanır",
+     'gl  = (row["gross_loss"] or 0) + (abs(gross_pnl) if gross_pnl < 0 else 0)',
+     'gl  = abs(gross_pnl) if gross_pnl < 0 else 0'),
+
+    ("M50", "trader.py", "Çözülmüş orphan kalıcı giriş kilidi bırakır",
+     'for sym in list(self.orphans):\n            if sym not in live:\n                self.orphans.pop(sym, None)',
+     'for sym in ():\n            if sym not in live:\n                self.orphans.pop(sym, None)'),
+
+    ("M51", "trader.py", "Bakiye senkronu genel timeout'u dışarı taşır",
+     'except Exception as e:\n            logger.error(f"Futures bakiye hatası: {e}")',
+     'except BinanceAPIException as e:\n            logger.error(f"Futures bakiye hatası: {e}")'),
+
+    ("M52", "trader.py", "Restart doğrulaması genel timeout'u dışarı taşır",
+     'except Exception as e:\n            # Borsayı okuyamıyorsak hiçbir şeyi doğrulanmış sayamayız.',
+     'except BinanceAPIException as e:\n            # Borsayı okuyamıyorsak hiçbir şeyi doğrulanmış sayamayız.'),
 ]
 
 

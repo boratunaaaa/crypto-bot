@@ -684,6 +684,14 @@ class FuturesTrader(ExitEngineMixin):
         self.unprotected: dict[str, str] = {}
         # Binance'de açık ama yerel kaydı olmayan pozisyonlar.
         self.orphans: dict[str, str] = {}
+        # Borsa pozisyon listesi en az bir kez eksiksiz okunmadan yeni risk
+        # alınmaz. Özellikle yerel pozisyon listesi boşken API hatası olursa
+        # `unprotected` üretilemez; ayrı sağlık bayrağı bu fail-open boşluğunu
+        # kapatır.
+        self.position_sync_ok = False
+        # Stop emrinin varlığı doğrulanamıyorsa mevcut stopa dokunmayız; fakat
+        # koruma bütünlüğünü kanıtlayana kadar yeni risk de almayız.
+        self.protection_unknown: dict[str, str] = {}
         # Borsa tarafında kapanan işlemler — main döngüsü bunları kill
         # switch'e işler ve listeyi tüketir.
         self.exchange_closed: list = []
@@ -738,7 +746,7 @@ class FuturesTrader(ExitEngineMixin):
                 if b["asset"] == "USDT":
                     self.balance = float(b["balance"])
                     return self.balance
-        except BinanceAPIException as e:
+        except Exception as e:
             logger.error(f"Futures bakiye hatası: {e}")
         return self.balance
 
@@ -1148,6 +1156,30 @@ class FuturesTrader(ExitEngineMixin):
             q = res.filled
             ap = res.avg_price if res.avg_price > 0 else price
 
+            # Giriş dolduğu anda yerel kaydı bellekte oluştur. Stop kimliği
+            # belli olmadan diske yazmıyoruz: stop borsada kurulup kimlik
+            # kaydedilmeden süreç çökerse restart ikinci stop kurabilirdi.
+            # Bu dar aralıktaki çökme güvenli biçimde orphan taramasına düşer.
+            notional = q * ap
+            commission_open = notional * COMMISSION_RATE
+            self.balance -= margin
+            self.total_commission += commission_open
+            pos = new_position(
+                symbol=symbol, side=side, entry_price=ap, qty=q,
+                margin=margin, leverage=leverage, stop_loss=sl, take_profit=tp,
+                atr_pct=atr_pct or 0.01, strategy=strategy,
+                reason_open=reason, score=score, btc_trend=btc_trend,
+                market_regime=market_regime, fear_greed=fear_greed,
+                entry_snapshot=entry_snapshot or {},
+                open_commission=commission_open,
+                stop_order_id=None,
+            )
+            if risk_amount:
+                pos["risk_amount"] = risk_amount
+            pos["income_start_ms"] = income_start_ms
+            self.positions[symbol] = pos
+            self.unprotected[symbol] = "giriş doldu, koruyucu stop henüz doğrulanmadı"
+
             # Koruyucu stop — bot çökerse pozisyon korumasız kalmasın.
             # Bot yaşadığı sürece stop'u kendisi yönetir ve bu emri günceller.
             sl_side = "SELL" if side == "BUY" else "BUY"
@@ -1162,14 +1194,14 @@ class FuturesTrader(ExitEngineMixin):
                                            side_up=(sl_side == "BUY")),
                 )
             if stop_order_id is None:
-                # DENETİM: bu komşu acil kapama yolu eski güvensiz yapıda
-                # kalmıştı — clientOrderId yok, kurtarma yok, doğrulama yok.
-                # Artık o da tek emir hattından geçiyor.
-                res = self._execute(symbol, sl_side, q, reduce_only=True,
-                                    purpose="giriş sonrası acil kapama")
-                if self._position_amount(symbol) != 0.0:
-                    self.unprotected[symbol] = "stop kurulamadı, kapama da doğrulanamadı"
-                    logger.error(f"{symbol}: stop yok VE kapama doğrulanamadı ({res.status})")
+                # Ortak acil-kapama yolu hem emri doğrular hem PnL/trade/
+                # kill-switch olayını üretir. Önceki yol pozisyonu kapatıyor
+                # fakat gerçekleşen işlemi tamamen muhasebe dışı bırakıyordu.
+                # Acil kapamanın akıbeti bilinmezken restart olursa pozisyon
+                # kaydı kaybolmasın; bu noktada henüz borsa stopu olmadığı
+                # doğrulandı, dolayısıyla duplicate-stop yarışı yoktur.
+                self._persist_positions()
+                self._mark_unprotected(pos, "giriş sonrası koruyucu stop kurulamadı")
                 return False, "SL kurulamadı, pozisyon koruma amaçlı kapatıldı"
 
             # DİKKAT: sabit TAKE_PROFIT_MARKET emri BİLEREK konmuyor.
@@ -1178,26 +1210,9 @@ class FuturesTrader(ExitEngineMixin):
             # 3.5×ATR'de kesin kapanıyordu). Çıkış artık `position.evaluate()`
             # tarafından yönetilir ve ÜST LİMİTİ YOKTUR.
 
-            notional = q * ap
-            commission_open = notional * COMMISSION_RATE
-            self.balance -= margin
-            self.total_commission += commission_open
-
-            pos = new_position(
-                symbol=symbol, side=side, entry_price=ap, qty=q,
-                margin=margin, leverage=leverage, stop_loss=sl, take_profit=tp,
-                atr_pct=atr_pct or 0.01, strategy=strategy,
-                reason_open=reason, score=score, btc_trend=btc_trend,
-                market_regime=market_regime, fear_greed=fear_greed,
-                entry_snapshot=entry_snapshot or {},
-                open_commission=commission_open,
-                stop_order_id=stop_order_id,
-            )
-            if risk_amount:
-                pos["risk_amount"] = risk_amount
-            # Gelir sorgusunun başlangıcı — giriş emrinden ÖNCE alındı.
-            pos["income_start_ms"] = income_start_ms
-            self.positions[symbol] = pos
+            pos["stop_order_id"] = stop_order_id
+            pos["_exchange_stop"] = sl
+            self.unprotected.pop(symbol, None)
 
             self.trade_log.append(dict(
                 time=datetime.now(), symbol=symbol,
@@ -1389,7 +1404,10 @@ class FuturesTrader(ExitEngineMixin):
                 self.pnl_unverified[symbol] = "acil kapanış PnL'i borsadan doğrulanamadı"
                 logger.error(f"{symbol}: acil kapanış PnL'i doğrulanamadı — "
                              f"yerel tahmin kaydedildi ({net:+.2f}$)")
-            self.total_pnl += net
+            # Kısmi çıkışların PnL'i gerçekleştiği anda total_pnl'e zaten
+            # işlendi. Tam işlem netini tekrar eklemek onları çift sayardı.
+            self.total_pnl += net - pos.get("realized_pnl", 0.0)
+            self.total_commission += comm
             if net >= 0: self.wins += 1
             else:        self.losses += 1
             self._record_trade(pos, px, "EMERGENCY_CLOSE",
@@ -1401,8 +1419,10 @@ class FuturesTrader(ExitEngineMixin):
                 pos.get("allocated_r", 1.0),
             ))
             self.unprotected.pop(symbol, None)
+            self.protection_unknown.pop(symbol, None)
             self.positions.pop(symbol, None)
             self._persist_positions()
+            self.sync_balance()
             logger.info(f"{symbol} korumasız kalınca kapatıldı ve doğrulandı | {net:+.2f}$")
         else:
             logger.error(f"{symbol} kapama emri gönderildi ama pozisyon hâlâ açık")
@@ -1424,6 +1444,8 @@ class FuturesTrader(ExitEngineMixin):
         """
         if self.equity_stale:
             return False, "Equity ölçülemiyor, yeni pozisyon açılmıyor"
+        if not self.position_sync_ok:
+            return False, "Borsa pozisyon durumu doğrulanamıyor, yeni pozisyon açılmıyor"
         if not self.pending_state_ok:
             return False, "Karantina durumu okunamıyor, yeni pozisyon açılmıyor"
         if not self.reconcile_state_ok:
@@ -1440,6 +1462,9 @@ class FuturesTrader(ExitEngineMixin):
         if self.orphans:
             return False, (f"Sahipsiz pozisyon var ({', '.join(self.orphans)}), "
                            f"yeni pozisyon açılmıyor")
+        if self.protection_unknown:
+            return False, (f"Stop koruması doğrulanamayan pozisyon var "
+                           f"({', '.join(self.protection_unknown)}), yeni pozisyon açılmıyor")
         return True, ""
 
     # Borsa gelir kayıtları anında yerleşmeyebilir. Sınırlı tekrar sorgusu.
@@ -1592,6 +1617,7 @@ class FuturesTrader(ExitEngineMixin):
                 logger.error(f"{symbol}: kapama tamamlanmadı ({res.status})")
                 return False, "Kapama tamamlanmadı"
             self.unprotected.pop(symbol, None)
+            self.protection_unknown.pop(symbol, None)
             if res.avg_price > 0:
                 price = res.avg_price          # PnL GERÇEK dolum fiyatından
             if res.filled > 0:
@@ -1679,7 +1705,7 @@ class FuturesTrader(ExitEngineMixin):
 
         try:
             raw = self.client.futures_position_information()
-        except BinanceAPIException as e:
+        except Exception as e:
             # Borsayı okuyamıyorsak hiçbir şeyi doğrulanmış sayamayız.
             logger.error(f"Restart doğrulaması yapılamadı: {e} — tüm pozisyonlar şüpheli")
             for sym in self.positions:
@@ -1783,9 +1809,15 @@ class FuturesTrader(ExitEngineMixin):
                     if amt != 0:
                         live[p["symbol"]] = {"qty": abs(amt),
                                              "side": "BUY" if amt > 0 else "SELL"}
-            except BinanceAPIException as e:
+            except Exception as e:
                 logger.warning(f"Sahipsiz pozisyon taraması yapılamadı: {e}")
                 return
+
+        # Daha önce sahipsiz görülen pozisyon artık borsada yoksa kalıcı giriş
+        # kilidi bırakmamalı. `live` bu noktada eksiksiz okunmuş bir snapshot.
+        for sym in list(self.orphans):
+            if sym not in live:
+                self.orphans.pop(sym, None)
 
         for sym in live:
             if sym in self.positions:
@@ -1816,44 +1848,16 @@ class FuturesTrader(ExitEngineMixin):
             for sym in list(self.positions.keys()):
                 if sym not in binance_open:
                     pos = self.positions.pop(sym)
+                    self.protection_unknown.pop(sym, None)
+                    self.unprotected.pop(sym, None)
                     # DENETİM BULGUSU: income sorgusu başarısız olursa işlem
                     # 0 PnL ile "kapandı" kaydediliyordu — kill switch gerçek
                     # zararı görmüyordu. Ayrıca borsanın REALIZED_PNL geçmişi
                     # kısmi çıkışları ZATEN içeriyor; üstüne yerel
                     # `realized_pnl` eklemek aynı kârı İKİ KEZ sayıyordu.
-                    pnl = None
-                    pnl_verified = True
                     close_px = pos["entry_price"]
                     since = self._income_since(pos)
-                    try:
-                        income = self.client.futures_income_history(
-                            symbol=sym, incomeType="REALIZED_PNL",
-                            startTime=since, limit=50,
-                        )
-                        if income:
-                            pnl = sum(float(i["income"]) for i in income)
-                    except Exception as e:
-                        pnl_verified = False
-                        logger.error(f"SYNC: {sym} PnL geçmişi okunamadı: {e}")
-                    # DENETİM: yalnız REALIZED_PNL okunuyordu; komisyon ve
-                    # funding net sonuçtan düşülmüyordu. Kill switch gerçek
-                    # NET zarar yerine daha iyimser BRÜT PnL görüyordu.
-                    if pnl is not None:
-                        for kind in ("COMMISSION", "FUNDING_FEE"):
-                            try:
-                                extra = self.client.futures_income_history(
-                                    symbol=sym, incomeType=kind,
-                                    startTime=since, limit=50,
-                                )
-                                if extra:
-                                    pnl += sum(float(i["income"]) for i in extra)
-                            except Exception as ie:
-                                # DENETİM BULGUSU: bu yalnız uyarı yazıyordu ve
-                                # EKSİK sonuç kill switch'e "ölçülmüş" gibi
-                                # gidiyordu. Net'in bir bileşeni okunamadıysa
-                                # sonuç DOĞRULANMIŞ değildir.
-                                pnl_verified = False
-                                logger.error(f"SYNC: {sym} {kind} okunamadı: {ie}")
+                    measured_net, pnl_verified = self._exchange_net_pnl(sym, since)
                     try:
                         tk = self.client.futures_symbol_ticker(symbol=sym)
                         close_px = float(tk["price"])
@@ -1862,20 +1866,28 @@ class FuturesTrader(ExitEngineMixin):
 
                     # Ölçemiyorsak "kâr yok" saymak yerine, en kötü bilinen
                     # durumu kullan: kalan pozisyon stop'a çarpmış.
-                    est = -abs(pos["entry_price"] - pos.get("stop_loss", pos["entry_price"])) * pos["qty"]
-                    if pnl is None:
-                        pnl = est
+                    stop_px = pos.get("stop_loss", pos["entry_price"])
+                    est_remaining = (
+                        -abs(pos["entry_price"] - stop_px) * pos["qty"]
+                        - pos["qty"] * stop_px * COMMISSION_RATE
+                    )
+                    est_total = (
+                        pos.get("realized_pnl", 0.0)
+                        + est_remaining
+                        - pos.get("open_commission", 0.0)
+                    )
+                    if measured_net is None:
+                        total_net = est_total
                         self.pnl_unverified[sym] = "kapanış PnL'i ölçülemedi (stop zararı varsayıldı)"
                         logger.error(
-                            f"SYNC: {sym} PnL doğrulanamadı — stop zararı varsayıldı ({pnl:+.2f}$)"
+                            f"SYNC: {sym} PnL doğrulanamadı — stop zararı varsayıldı "
+                            f"({total_net:+.2f}$)"
                         )
-                        total_net = pnl + pos.get("realized_pnl", 0.0)
                     elif not pnl_verified:
                         # Net'in bir bileşeni okunamadı. Ölçülen sayı EKSİK,
                         # yani gerçekten daha iyimser. Kill switch'e iyimser
                         # olanı göndermeyiz: iki tahminin kötüsü kullanılır.
-                        total_net = min(pnl, est)
-                        pnl = total_net
+                        total_net = min(measured_net, est_total)
                         self.pnl_unverified[sym] = "kapanış PnL'i eksik bileşenli (muhafazakâr değer)"
                         logger.error(
                             f"SYNC: {sym} net PnL doğrulanamadı — muhafazakâr "
@@ -1883,8 +1895,10 @@ class FuturesTrader(ExitEngineMixin):
                         )
                     else:
                         # Borsa geçmişi kısmi çıkışları zaten içerir.
-                        total_net = pnl
-                    self.total_pnl += pnl
+                        total_net = measured_net
+                    # Kısmi PnL daha önce işlendi; yalnız henüz işlenmemiş
+                    # farkı ekle.
+                    self.total_pnl += total_net - pos.get("realized_pnl", 0.0)
                     if total_net >= 0: self.wins += 1
                     else:              self.losses += 1
 
@@ -1923,12 +1937,14 @@ class FuturesTrader(ExitEngineMixin):
             self._audit_live_positions(live)
             self._detect_orphans(live)
             self._persist_positions()
+            self.position_sync_ok = True
             return binance_open
         except Exception as e:
             # FAIL-CLOSED: borsayı okuyamıyorsak hiçbir şeyi doğrulanmış
             # sayamayız. Sessizce boş küme dönmek, main döngüsüne "her şey
             # yolunda" demekle aynı şey.
             logger.error(f"Pozisyon sync hatası: {type(e).__name__}: {e}")
+            self.position_sync_ok = False
             for sym in self.positions:
                 self.unprotected.setdefault(sym, "borsa durumu doğrulanamıyor")
             return set()
@@ -1955,11 +1971,18 @@ class FuturesTrader(ExitEngineMixin):
                 pos["qty"] = info["qty"]
             state = self._verify_stop_exists(sym, pos.get("stop_order_id"))
             if state is None:
+                self.protection_unknown[sym] = "koruyucu stop durumu okunamıyor"
                 logger.warning(f"SYNC: {sym} stop durumu doğrulanamadı — dokunulmuyor")
                 continue
+            self.protection_unknown.pop(sym, None)
+            if self.unprotected.get(sym) in {
+                "borsa durumu doğrulanamıyor",
+                "restart doğrulanamadı",
+                "stop durumu doğrulanamadı (restart)",
+            }:
+                self.unprotected.pop(sym, None)
             if state is False:
                 logger.warning(f"SYNC: {sym} koruyucu stop kaybolmuş, yeniden kuruluyor")
-                sl_side = "SELL" if pos["side"] == "BUY" else "BUY"
                 sl_side = "SELL" if pos["side"] == "BUY" else "BUY"
                 new_id = self._place_stop(sym, sl_side, pos["stop_loss"])
                 if new_id is not None:

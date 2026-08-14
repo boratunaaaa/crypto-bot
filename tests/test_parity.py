@@ -53,6 +53,7 @@ def _make_futures_trader():
         cl.futures_account_balance.return_value = [{"asset": "USDT", "balance": "1000.0"}]
         t = FuturesTrader()
         t.balance = 1000.0
+        t.position_sync_ok = True
         return t
 
 

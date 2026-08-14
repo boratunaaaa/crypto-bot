@@ -661,7 +661,19 @@ def run():
                 # pozisyon boyutu da risk hesabı da güvenilmezdir.
                 **{s: f"uzlaştırma gerekli ({r})"
                    for s, r in getattr(trader, "reconcile_needed", {}).items()},
+                **{s: f"stop doğrulanamıyor ({r})"
+                   for s, r in getattr(trader, "protection_unknown", {}).items()},
+                **{s: "emir akıbeti bilinmiyor"
+                   for s in getattr(trader, "pending_unknown", {})},
             }
+            if hasattr(trader, "position_sync_ok") and not trader.position_sync_ok:
+                guard_issues["SYSTEM/POSITION_SYNC"] = "borsa pozisyonları doğrulanamıyor"
+            if hasattr(trader, "pending_state_ok") and not trader.pending_state_ok:
+                guard_issues["SYSTEM/PENDING_STATE"] = "emir karantinası okunamıyor/yazılamıyor"
+            if hasattr(trader, "reconcile_state_ok") and not trader.reconcile_state_ok:
+                guard_issues["SYSTEM/RECONCILE_STATE"] = "uzlaştırma durumu okunamıyor/yazılamıyor"
+            if getattr(trader, "equity_stale", False):
+                guard_issues["SYSTEM/EQUITY"] = "canlı equity doğrulanamıyor"
             if guard_issues:
                 can_trade = False
                 ks_reason = "Koruma bütünlüğü bozuk: " + ", ".join(

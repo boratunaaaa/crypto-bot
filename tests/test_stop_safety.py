@@ -48,6 +48,7 @@ def _trader(tick="0.01"):
         cl.futures_income_history.return_value = []
         t = FuturesTrader()
         t.balance = 1000.0
+        t.position_sync_ok = True
         t.SETTLE_DELAY_SEC = 0        # testlerde gerçek beklemeye gerek yok
         return t
 
@@ -270,9 +271,16 @@ def test_restart_adopts_exchange_quantity_on_mismatch():
 def test_restart_marks_all_suspect_when_exchange_unreachable():
     """Borsa okunamıyorsa hiçbir pozisyon 'doğrulanmış' sayılamaz."""
     t = _trader()
-    t.client.futures_position_information.side_effect = _api_error(-1001)
+    t.client.futures_position_information.side_effect = TimeoutError("generic timeout")
     t.restore_positions({"TESTUSDT": _pos()})
     assert "TESTUSDT" in t.unprotected
+
+
+def test_sync_balance_generic_timeout_keeps_last_known_balance():
+    t = _trader()
+    t.balance = 987.0
+    t.client.futures_account_balance.side_effect = TimeoutError("generic timeout")
+    assert t.sync_balance() == pytest.approx(987.0)
 
 
 # ── Sahipsiz pozisyon (açık #3) ──────────────────────────────────────────────
@@ -299,6 +307,16 @@ def test_known_position_is_not_flagged_as_orphan():
     t.client.futures_get_order.return_value = {"status": "NEW"}
     t.restore_positions({"TESTUSDT": _pos()})
     assert t.orphans == {}
+
+
+def test_resolved_orphan_does_not_leave_permanent_entry_lock():
+    t = _trader()
+    t.orphans["OLDUSDT"] = "önceki senkron"
+
+    t._detect_orphans({})
+
+    assert t.orphans == {}
+    assert t.can_open_new_risk()[0] is True
 
 
 # ── Kapama hatası sınıflandırması ────────────────────────────────────────────
@@ -2015,3 +2033,206 @@ def test_daily_stats_flags_unverified_trades():
         row = dict(con.execute("SELECT num_trades, unverified FROM daily_stats").fetchone())
     assert row["num_trades"] == 2, "işlem dışlandı — zarar raporda kayboldu"
     assert row["unverified"] == 1, "doğrulanmamış işlem UPDATE yolunda işaretlenmedi"
+
+
+# ── 11. denetim turu ─────────────────────────────────────────────────────────
+
+def test_position_sync_failure_blocks_entries_with_empty_local_book():
+    """Yerel pozisyon yokluğu, borsada da pozisyon olmadığının kanıtı değildir.
+    Position API okunamıyorsa sahipsiz risk ihtimali nedeniyle giriş durmalı."""
+    t = _trader()
+    t.positions.clear()
+    t.client.futures_position_information.side_effect = TimeoutError("position API down")
+
+    t.sync_positions()
+
+    ok, msg = t.can_open_new_risk()
+    assert t.position_sync_ok is False
+    assert ok is False and "pozisyon" in msg.lower()
+
+
+def test_successful_position_sync_reopens_only_its_own_gate():
+    t = _trader()
+    t.position_sync_ok = False
+    t.client.futures_position_information.return_value = []
+
+    t.sync_positions()
+
+    assert t.position_sync_ok is True
+    assert t.can_open_new_risk()[0] is True
+
+
+def test_unknown_runtime_stop_blocks_new_risk_without_duplicate_or_emergency():
+    """Stopu sorgulayamamak 'stop yok' değildir; mevcut emre dokunulmaz ama
+    koruma doğrulanana kadar yeni risk de alınmaz."""
+    t = _trader()
+    t.positions["TESTUSDT"] = _pos()
+    t.client.futures_position_information.return_value = [
+        {"symbol": "TESTUSDT", "positionAmt": "1.0"}
+    ]
+    t.client.futures_get_order.side_effect = TimeoutError("order API down")
+    before = t.client.futures_create_order.call_count
+
+    t.sync_positions()
+
+    assert "TESTUSDT" in t.protection_unknown
+    assert t.can_open_new_risk()[0] is False
+    assert t.client.futures_create_order.call_count == before
+
+    # API düzelip aynı stop doğrulanınca yalnız bu geçici kilit kalkar.
+    t.client.futures_get_order.side_effect = None
+    t.client.futures_get_order.return_value = {"status": "NEW"}
+    t.sync_positions()
+    assert t.protection_unknown == {}
+    assert t.can_open_new_risk()[0] is True
+
+
+def test_entry_emergency_close_is_recorded_and_reaches_kill_switch():
+    """Giriş dolar, stop kurulamaz ve acil kapama başarılı olursa bu da gerçek
+    bir işlemdir: DB, PnL ve kill-switch kuyruğunda görünmelidir."""
+    import database
+    t = _trader()
+    entry = {"orderId": 1, "executedQty": "1.0", "avgPrice": "100.0", "status": "FILLED"}
+    emergency = {"orderId": 2, "executedQty": "1.0", "avgPrice": "99.0", "status": "FILLED"}
+    t.client.futures_create_order.side_effect = [entry, RuntimeError("stop rejected"), emergency]
+    t.client.futures_get_open_orders.return_value = []
+    t.client.futures_position_information.return_value = []
+
+    def income(**kw):
+        return {
+            "REALIZED_PNL": [{"income": "-1.0"}],
+            "COMMISSION": [{"income": "-0.08"}],
+            "FUNDING_FEE": [],
+        }.get(kw.get("incomeType"), [])
+
+    t.client.futures_income_history.side_effect = income
+    ok, _ = t.open_position(
+        "TESTUSDT", "BUY", 100.0, 50.0, 3, 98.0, 107.0,
+        qty=1.0, risk_amount=2.0,
+    )
+
+    assert ok is False
+    assert "TESTUSDT" not in t.positions
+    assert t.exchange_closed and t.exchange_closed[-1][1] == "EMERGENCY_CLOSE"
+    assert t.exchange_closed[-1][2] == pytest.approx(-1.08)
+    assert t.total_pnl == pytest.approx(-1.08)
+    with database._conn() as con:
+        row = dict(con.execute(
+            "SELECT reason_close, net_pnl, pnl_verified FROM trades ORDER BY id DESC LIMIT 1"
+        ).fetchone())
+    assert row == {
+        "reason_close": "EMERGENCY_CLOSE",
+        "net_pnl": pytest.approx(-1.08),
+        "pnl_verified": 1,
+    }
+
+
+def test_successful_entry_is_not_persisted_before_stop_id_is_known():
+    """Stop borsada kurulup kimliği kaydedilmeden yazılan pozisyon restart'ta
+    ikinci stop üretebilir. Başarılı giriş snapshot'larının hepsi stop kimlikli
+    olmalı."""
+    import copy
+    t = _trader()
+    seen = []
+
+    with patch("trader.save_open_positions", side_effect=lambda p: seen.append(copy.deepcopy(p))):
+        ok, _ = t.open_position(
+            "TESTUSDT", "BUY", 100.0, 50.0, 3, 98.0, 107.0,
+            qty=1.0, risk_amount=2.0,
+        )
+
+    assert ok is True and seen
+    assert all(
+        not snapshot or snapshot["TESTUSDT"].get("stop_order_id")
+        for snapshot in seen
+    ), "stop kimliği bilinmeden pozisyon diske yazıldı"
+
+
+def test_exchange_stop_with_empty_commission_is_unverified():
+    """Borsa-stop senkronu da ortak zorunlu-komisyon sözleşmesine uymalı."""
+    import database
+    t = _trader()
+    t.positions["TESTUSDT"] = _pos(stop=95.0)
+    t.client.futures_position_information.return_value = []
+    t.client.futures_symbol_ticker.return_value = {"price": "95.0"}
+
+    def income(**kw):
+        return [{"income": "7.0"}] if kw.get("incomeType") == "REALIZED_PNL" else []
+
+    t.client.futures_income_history.side_effect = income
+    t.INCOME_RETRY_SEC = 0
+    t.sync_positions()
+
+    assert t.exchange_closed[-1][2] < 0, "eksik komisyonlu iyimser PnL kullanıldı"
+    with database._conn() as con:
+        row = dict(con.execute(
+            "SELECT pnl_verified FROM trades ORDER BY id DESC LIMIT 1"
+        ).fetchone())
+    assert row["pnl_verified"] == 0
+
+
+def test_exchange_stop_does_not_double_count_prior_partial_pnl():
+    t = _trader()
+    pos = _pos(stop=95.0)
+    pos["realized_pnl"] = 2.0
+    t.positions["TESTUSDT"] = pos
+    t.total_pnl = 2.0  # kısmi çıkış anında zaten işlendi
+    t.client.futures_position_information.return_value = []
+
+    def income(**kw):
+        return {
+            "REALIZED_PNL": [{"income": "6.0"}],
+            "COMMISSION": [{"income": "-1.0"}],
+            "FUNDING_FEE": [],
+        }.get(kw.get("incomeType"), [])
+
+    t.client.futures_income_history.side_effect = income
+    t.sync_positions()
+    assert t.total_pnl == pytest.approx(5.0), "kısmi PnL ikinci kez eklendi"
+
+
+def test_unverified_profit_cannot_break_loss_streak_or_raise_dynamic_risk():
+    import datetime as dt
+    import database
+    from risk_manager import dynamic_risk_pct
+
+    base = dict(
+        symbol="TESTUSDT", side="BUY", entry_price=100.0, close_price=101.0,
+        margin=33.0, leverage=3, commission=0.0,
+        reason_open="t", reason_close="TP",
+        open_time=dt.datetime(2026, 8, 14, 10, 0),
+        close_time=dt.datetime(2026, 8, 14, 12, 0),
+    )
+    for pnl in (10.0, 10.0, 10.0, -1.0, -1.0):
+        database.save_trade(
+            **base, gross_pnl=pnl, net_pnl=pnl, pnl_verified=True,
+        )
+    before = database.get_recent_pnls(30)
+    risk_before = dynamic_risk_pct(before, 50)
+
+    database.save_trade(
+        **base, gross_pnl=50.0, net_pnl=50.0, pnl_verified=False,
+    )
+    after = database.get_recent_pnls(30)
+    risk_after = dynamic_risk_pct(after, 50)
+
+    assert after == before, "doğrulanmamış kâr geçmişte 0/pozitif gözlem bıraktı"
+    assert risk_after <= risk_before
+
+
+def test_daily_profit_factor_uses_cumulative_gross_loss():
+    import datetime as dt
+    import database
+
+    day = dt.date(2026, 8, 14)
+    database._update_daily_stats(day, 10.0, 0.0, 10.0)
+    database._update_daily_stats(day, -2.0, 0.0, -2.0)
+    database._update_daily_stats(day, -3.0, 0.0, -3.0)
+
+    with database._conn() as con:
+        row = dict(con.execute(
+            "SELECT gross_pnl, gross_loss, profit_factor FROM daily_stats"
+        ).fetchone())
+    assert row["gross_pnl"] == pytest.approx(10.0)
+    assert row["gross_loss"] == pytest.approx(5.0)
+    assert row["profit_factor"] == pytest.approx(2.0)

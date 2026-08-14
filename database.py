@@ -85,6 +85,7 @@ CREATE TABLE IF NOT EXISTS daily_stats (
     wins          INTEGER,
     losses        INTEGER,
     gross_pnl     REAL,
+    gross_loss    REAL DEFAULT 0,
     commission    REAL,
     net_pnl       REAL,
     win_rate      REAL,
@@ -181,7 +182,10 @@ _TRADE_COLUMNS = [
 ]
 
 
-_DAILY_COLUMNS = [("unverified", "INTEGER", "0")]
+_DAILY_COLUMNS = [
+    ("unverified", "INTEGER", "0"),
+    ("gross_loss", "REAL", "0"),
+]
 
 
 def _migrate(con):
@@ -415,18 +419,20 @@ def _update_daily_stats(stat_date: date, net_pnl: float, commission: float,
             if row is None:
                 con.execute("""
                     INSERT INTO daily_stats
-                    (stat_date, num_trades, wins, losses, gross_pnl, commission,
+                    (stat_date, num_trades, wins, losses, gross_pnl, gross_loss, commission,
                      net_pnl, win_rate, profit_factor, max_win, max_loss,
                      unverified)
-                    VALUES (?,1,?,?,?,?,?,?,?,?,?,?)
+                    VALUES (?,1,?,?,?,?,?,?,?,?,?,?,?)
                 """, (
                     str(stat_date),
                     1 if net_pnl >= 0 else 0,
                     0 if net_pnl >= 0 else 1,
                     gross_pnl if gross_pnl >= 0 else 0,
+                    abs(gross_pnl) if gross_pnl < 0 else 0,
                     commission, net_pnl,
                     1.0 if net_pnl >= 0 else 0.0,
-                    0.0,
+                    ((gross_pnl if gross_pnl >= 0 else 0)
+                     / ((abs(gross_pnl) if gross_pnl < 0 else 0) or 0.001)),
                     net_pnl if net_pnl >= 0 else 0,
                     net_pnl if net_pnl < 0  else 0,
                     0 if verified else 1,
@@ -436,7 +442,7 @@ def _update_daily_stats(stat_date: date, net_pnl: float, commission: float,
                 w   = row["wins"]   + (1 if net_pnl >= 0 else 0)
                 l   = row["losses"] + (0 if net_pnl >= 0 else 1)
                 gp  = row["gross_pnl"]  + (gross_pnl if gross_pnl >= 0 else 0)
-                gl  = abs(gross_pnl) if gross_pnl < 0 else 0
+                gl  = (row["gross_loss"] or 0) + (abs(gross_pnl) if gross_pnl < 0 else 0)
                 com = row["commission"] + commission
                 np_ = row["net_pnl"]    + net_pnl
                 wr  = w / nt
@@ -445,11 +451,11 @@ def _update_daily_stats(stat_date: date, net_pnl: float, commission: float,
                 ml  = min(row["max_loss"], net_pnl if net_pnl <  0 else 0)
                 con.execute("""
                     UPDATE daily_stats SET
-                    num_trades=?, wins=?, losses=?, gross_pnl=?, commission=?,
+                    num_trades=?, wins=?, losses=?, gross_pnl=?, gross_loss=?, commission=?,
                     net_pnl=?, win_rate=?, profit_factor=?, max_win=?, max_loss=?,
                     unverified=?
                     WHERE stat_date=?
-                """, (nt, w, l, gp, com, np_, wr, pf, mw, ml,
+                """, (nt, w, l, gp, gl, com, np_, wr, pf, mw, ml,
                       (row["unverified"] or 0) + (0 if verified else 1),
                       str(stat_date)))
     except Exception as e:
@@ -574,19 +580,22 @@ def get_recent_pnls(n: int = 30) -> list[float]:
     borsadan doğrulanmamış bir "kâr", bir sonraki işlemin riskini ARTIRABİLİYORDU.
 
     Kural: doğrulanmamış sonuç riski AZALTMAK için kullanılabilir, ARTIRMAK
-    için kullanılamaz. Doğrulanmamış KÂR görmezden gelinir (0 sayılır),
-    doğrulanmamış ZARAR olduğu gibi kalır — muhafazakâr yön budur.
+    için kullanılamaz. Doğrulanmamış KÂR tamamen dışlanır; 0 yazmak ardışık
+    zarar serisini kesip riski yine artırabilir. Doğrulanmamış ZARAR olduğu
+    gibi kalır — muhafazakâr yön budur.
     """
     try:
         with _conn() as con:
             rows = con.execute(
                 "SELECT net_pnl, COALESCE(pnl_verified, 0) AS v "
-                "FROM trades ORDER BY id DESC LIMIT ?", (n,)
+                "FROM trades "
+                "WHERE COALESCE(pnl_verified, 0) = 1 OR net_pnl < 0 "
+                "ORDER BY id DESC LIMIT ?", (n,)
             ).fetchall()
             out = []
             for r in reversed(rows):
                 pnl = r["net_pnl"] or 0.0
-                out.append(pnl if (r["v"] or pnl < 0) else 0.0)
+                out.append(pnl)
             return out
     except Exception:
         return []
