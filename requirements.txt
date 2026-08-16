@@ -3,6 +3,20 @@
 # DENETİM (2026-08-16): `python-binance` listede yoktu ama main/trader/
 # market_data/data_feed/backtest hepsi ondan import ediyor. Temiz bir makinede
 # bu dosyadan kurulum yapmak çalışmayan bir bot üretirdi.
+#
+# 1.0.19'DA SABİT — 1.0.37 DENENDİ VE GERİ ALINDI (2026-08-16, canlı):
+# Yükseltme WebSocket kopmalarını GERÇEKTEN çözüyor (ölçüldü: 3 dakikada
+# 744 → 16.977 mesaj, en uzun sessizlik 171.8 sn → 0.1 sn). Ama bizim
+# `market_data._start_ws()/_stop_twm()` yeniden başlatma mantığımız yeni
+# sürümde geride dönen bir dinleyici bırakıyor: kapanmış okuma döngüsünden
+# `recv()` çağrılıyor ve saniyede ~200 satır
+# "Read loop has been closed" hatası basılıyor (20 saniyede 1,5 MB log,
+# saatte ~75 MB). Bot çalışmaya devam ediyor ama bu diski doldurur.
+#
+# Yükseltmeden ÖNCE yapılması gereken: WS yeniden başlatma/durdurma yolu
+# 1.0.37'nin yaşam döngüsüne uyarlanmalı (sağlıklı akışta watchdog'un
+# gereksiz restart atmaması + `_stop_twm()`'in dinleyiciyi gerçekten
+# sonlandırması). O yapılmadan yükseltme yapılmamalı.
 python-binance==1.0.19
 numpy==2.2.6
 pandas-ta==0.4.71b0
