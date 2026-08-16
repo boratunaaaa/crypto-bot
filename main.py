@@ -872,6 +872,17 @@ def run():
                 # WebSocket düşmüş olabilir.
                 fresh_px = mdm.get_price(sig.symbol)
                 if fresh_px is None:
+                    # DENETİM BULGUSU (2026-08-16): açık pozisyonlar için REST
+                    # yedeği vardı, GİRİŞ için yoktu. WS kütüphanesi sürüm
+                    # uyumsuzluğu yüzünden akış dakikalar boyunca kesilebiliyor;
+                    # o pencerede her sinyal "Fiyat bayat" diye çöpe gidiyordu.
+                    # Sinyal nadirdir — tek bir REST çağrısı ucuz, kaçan fırsat
+                    # pahalı. Tazelik kuralı korunuyor: REST de veremezse giriş
+                    # YİNE yapılmaz.
+                    fresh_px = mdm.get_prices_for(
+                        [sig.symbol], max_age_seconds=MAX_PRICE_AGE_SEC
+                    ).get(sig.symbol)
+                if fresh_px is None:
                     save_missed_signal(
                         sig.symbol, sig.action, sig.score, sig.confidence,
                         f"Fiyat bayat ({mdm.price_age(sig.symbol):.0f}s)",

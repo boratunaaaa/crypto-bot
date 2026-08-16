@@ -13,6 +13,45 @@ from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from binance import ThreadedWebsocketManager
 
+
+def _patch_ws_fail_connection() -> bool:
+    """python-binance ↔ websockets sürüm uyumsuzluğunu kapat.
+
+    DENETİM BULGUSU (2026-08-16, canlı): python-binance 1.0.19 soketi
+    kapatırken `self.ws.fail_connection()` çağırıyor. websockets ≥14'te bu
+    metot `ClientConnection`'dan kaldırıldı, dolayısıyla her kapanışta
+    `AttributeError` fırlıyor. Bu hata `__aexit__`'in ortasında oluştuğu için
+    kütüphanenin KENDİ yeniden bağlanma mantığı hiç çalışmıyor: dinleyici
+    görev ölüyor ve soket ancak bizim watchdog'umuz 60+ saniye sonra fark
+    edince elle ayağa kalkıyordu. Canlıda soket ~2 dakikada bir ölüyor, aradaki
+    boşlukta fiyatlar bayatlıyor ve hiçbir giriş yapılamıyordu.
+
+    Kalıcı çözüm sürüm yükseltmesidir; bu yama ortama dokunmadan aynı
+    davranışı geri kazandırır. Metot zaten varsa HİÇBİR ŞEY yapmaz, yani
+    yükseltmeden sonra kendiliğinden devre dışı kalır.
+    """
+    try:
+        from websockets.asyncio.client import ClientConnection
+    except Exception:
+        return False
+    if hasattr(ClientConnection, "fail_connection"):
+        return False
+
+    def fail_connection(self, *_args, **_kwargs):
+        # Senkron olmalı: python-binance bunu await ETMEDEN çağırıyor.
+        transport = getattr(self, "transport", None)
+        if transport is not None:
+            try:
+                transport.abort()
+            except Exception:
+                pass
+
+    ClientConnection.fail_connection = fail_connection
+    return True
+
+
+_WS_PATCHED = _patch_ws_fail_connection()
+
 from config import (
     API_KEY, API_SECRET, TESTNET,
     TF_ENTRY, TF_TREND, TF_MACRO, TF_CONTEXT, CANDLE_LIMIT,
@@ -375,7 +414,8 @@ class MarketDataManager:
             self._last_ws_msg = time.time()
             self._last_price_update = time.time()
             self._fmt_alerted = False
-            logger.info(f"WebSocket başlatıldı ({stream})")
+            patched = " [ws uyumluluk yaması etkin]" if _WS_PATCHED else ""
+            logger.info(f"WebSocket başlatıldı ({stream}){patched}")
         except Exception as e:
             logger.error(f"WebSocket başlatma hatası: {e}")
             self._twm = None
@@ -392,7 +432,11 @@ class MarketDataManager:
             # Yeniden bağlanmak bunu çözmez; tam olarak bu ayrımı yapmadığımız
             # için bot saatlerce boşuna reconnect döngüsünde kaldı ve tek işlem
             # açmadı. Bu durum ayrı ve YÜKSEK sesle raporlanır.
-            if age <= 60:
+            # 60s'ti. Kütüphane sürüm uyumsuzluğu yüzünden akış dakikalar
+            # içinde kesilebiliyor; eşiği düşürmek ölü pencereyi kısaltır.
+            # Yanlış pozitif maliyeti düşük (yeniden bağlanmak ucuz), kaçırılan
+            # kesintinin maliyeti yüksek (giriş yapılamıyor).
+            if age <= 30:
                 stale = time.time() - self._last_price_update
                 if stale > 120 and not self._fmt_alerted:
                     logger.error(
