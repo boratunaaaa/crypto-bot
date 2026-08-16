@@ -19,7 +19,12 @@ sys.path.insert(0, str(_ROOT))
 os.environ.setdefault("BINANCE_API_KEY", "test-key-not-real")
 os.environ.setdefault("BINANCE_API_SECRET", "test-secret-not-real")
 
-_TMP_DB = Path(tempfile.gettempdir()) / "crypto_bot_test.db"
+# Dosya adı SÜRECE ÖZEL: sabit bir isim, aynı anda çalışan iki pytest sürecini
+# aynı dosyaya bağlıyordu. Fixture her testten sonra dosyayı sildiği için iki
+# süreç birbirinin veritabanını ayağının altından çekiyor ve testler gerçekte
+# olmayan sqlite hatalarıyla düşüyordu (mutasyon taraması paralel koşarken
+# birebir yaşandı).
+_TMP_DB = Path(tempfile.gettempdir()) / f"crypto_bot_test_{os.getpid()}.db"
 os.environ["CRYPTO_BOT_DB"] = str(_TMP_DB)
 
 import pytest

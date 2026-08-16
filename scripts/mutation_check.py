@@ -22,32 +22,31 @@ KULLANIM
 
 from __future__ import annotations
 
-import atexit
-import signal
+import concurrent.futures as cf
+import os
+import queue
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
-# Script yarıda kesilirse (SIGINT/SIGTERM) mutasyon dosyada KALMAMALI.
-# Bu koruma olmadan bir kill, kaynak dosyayı bozuk hâlde bırakır.
-_ORIGINALS: dict[Path, str] = {}
-
-
-def _restore_all(*_):
-    for path, text in list(_ORIGINALS.items()):
-        try:
-            path.write_text(text)
-        except Exception:
-            pass
-    _ORIGINALS.clear()
-
-
-atexit.register(_restore_all)
-for _sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-    signal.signal(_sig, lambda *a: (_restore_all(), sys.exit(130)))
+# ÇALIŞMA AĞACINA ASLA YAZILMAZ.
+#
+# DENETİM BULGUSU (2026-08-16): eski sürüm mutasyonu doğrudan depodaki dosyaya
+# yazıp `finally` ile geri alıyordu. Sinyal yakalayıcıları SIGINT/SIGTERM'i
+# kurtarıyordu ama SIGKILL'i kimse yakalayamaz — otomatik test koşucusu 300
+# saniyede zaman aşımıyla süreci SIGKILL'lediğinde `trader.py` MUTASYONA
+# UĞRAMIŞ hâlde kaldı. Aynı gün ikinci bir olayda, tarama sürerken alınan bir
+# rsync mutasyona uğramış kodu sunucuya taşıdı.
+#
+# Çözüm yamalamak değil, tasarımı değiştirmek: mutasyon yalnız geçici bir
+# kopyaya uygulanır. Süreç nasıl ölürse ölsün depo bozulmaz ve tarama, başka
+# işlerle (deploy, rsync, commit) aynı anda güvenle çalışabilir.
 
 ROOT = Path(__file__).resolve().parent.parent
-PYTEST = [str(ROOT / ".venv/bin/python"), "-m", "pytest", "tests/", "-q", "-x"]
+_PYTEST_BASE = [str(ROOT / ".venv/bin/python"), "-m", "pytest", "-q", "-x"]
+PYTEST = _PYTEST_BASE + ["tests/"]          # geriye dönük uyumluluk
 
 # (kimlik, dosya, açıklama, aranan, yerine konan)
 MUTATIONS: list[tuple[str, str, str, str, str]] = [
@@ -323,33 +322,124 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
 ]
 
 
+def _tracked_files() -> list[str]:
+    out = subprocess.run(["git", "ls-files"], cwd=ROOT,
+                         capture_output=True, text=True, check=True)
+    return [l for l in out.stdout.splitlines() if l]
+
+
+def _make_snapshot(dest: Path) -> None:
+    """Depoyu izole bir dizine kopyala (yalnız git'in bildiği dosyalar)."""
+    for rel in _tracked_files():
+        src = ROOT / rel
+        if not src.is_file():
+            continue
+        dst = dest / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+
+
+# Hangi kaynak dosyayı hangi testler ölçüyor (import ilişkisinden çıkarıldı).
+# Yalnız HIZLANDIRMA amaçlıdır; doğruluğu etkilemez, çünkü hedefli koşu
+# mutasyonu yakalayamazsa TAM suite ile teyit edilir (bkz. _run_one).
+_TARGETED_TESTS = {
+    "risk_manager.py":  ["tests/test_risk.py", "tests/test_stop_safety.py",
+                         "tests/test_persistence.py"],
+    "database.py":      ["tests/test_weekly_pnl.py", "tests/test_persistence.py",
+                         "tests/test_momentum.py", "tests/test_parity.py"],
+    "trader.py":        ["tests/test_stop_safety.py", "tests/test_parity.py",
+                         "tests/test_persistence.py"],
+    "go_live_check.py": ["tests/test_stop_safety.py"],
+    "market_data.py":   ["tests/test_ws_ingest.py"],
+}
+
+
+def _pytest_cmd(paths: list[str] | None) -> list[str]:
+    return _PYTEST_BASE + (paths if paths else ["tests/"])
+
+
+def _run_one(work: Path, mid: str, fname: str, desc: str, old: str, new: str):
+    """Tek mutasyonu KOPYADA dener. Gerçek çalışma ağacına dokunmaz.
+
+    İki aşama:
+      1. Yalnız o dosyayı ölçen testler koşar (saniyeler).
+      2. Orada yakalanmadıysa TAM suite koşar. "Sağ kaldı" kararı ASLA
+         hedefli koşuya dayanmaz — eksik bir eşleme sahte alarm üretirdi.
+    """
+    path = work / fname
+    original = path.read_text()
+    if original.count(old) != 1:
+        return ("missing", mid, desc, original.count(old))
+
+    env = dict(os.environ)
+    env.pop("CRYPTO_BOT_DB", None)          # conftest süreç-özel yol üretsin
+    try:
+        path.write_text(original.replace(old, new))
+
+        targeted = _TARGETED_TESTS.get(fname)
+        if targeted:
+            r = subprocess.run(_pytest_cmd(targeted), cwd=work,
+                               capture_output=True, text=True, env=env)
+            if r.returncode != 0:
+                return ("caught", mid, desc, None)
+
+        r = subprocess.run(_pytest_cmd(None), cwd=work,
+                           capture_output=True, text=True, env=env)
+    finally:
+        path.write_text(original)           # kopyayı sonraki iş için temizle
+    return ("caught" if r.returncode != 0 else "survived", mid, desc, None)
+
+
 def run() -> int:
     wanted = sys.argv[1:] or None
+    jobs = [m for m in MUTATIONS if not wanted or m[0] in wanted]
+    if not jobs:
+        print("Eşleşen mutasyon yok.")
+        return 1
+
+    # SIGKILL'lenen bir koşu kendi geçici dizinini silemez (kimse yakalayamaz).
+    # Depoya zarar vermez ama zamanla disk sızdırır; başlangıçta süpürülür.
+    for stale in Path(tempfile.gettempdir()).glob("mutcheck-*"):
+        shutil.rmtree(stale, ignore_errors=True)
+
+    workers = max(1, min(8, (os.cpu_count() or 2) - 1, len(jobs)))
+    tmp = Path(tempfile.mkdtemp(prefix="mutcheck-"))
     caught, survived, missing = [], [], []
 
-    for mid, fname, desc, old, new in MUTATIONS:
-        if wanted and mid not in wanted:
-            continue
-        path = ROOT / fname
-        original = path.read_text()
-        if original.count(old) != 1:
-            missing.append((mid, desc, original.count(old)))
-            print(f"  ??  {mid:5} HEDEF BULUNAMADI ({original.count(old)} eşleşme) — {desc}")
-            continue
-        _ORIGINALS[path] = original
-        try:
-            path.write_text(original.replace(old, new))
-            r = subprocess.run(PYTEST, cwd=ROOT, capture_output=True, text=True)
-        finally:
-            path.write_text(original)          # her hâlükârda geri al
-            _ORIGINALS.pop(path, None)
+    try:
+        # Her işçi kendi kopyasında çalışır. Böylece (a) mutasyon asla gerçek
+        # depoya yazılmaz, (b) işçiler birbirinin dosyasını bozmaz.
+        pool = [tmp / f"w{i}" for i in range(workers)]
+        for w in pool:
+            _make_snapshot(w)
+        print(f"  {len(jobs)} mutasyon, {workers} işçi, izole kopyalarda çalışıyor...\n",
+              flush=True)
 
-        if r.returncode != 0:
-            caught.append(mid)
-            print(f"  ✅  {mid:5} yakalandı        — {desc}")
-        else:
-            survived.append((mid, desc))
-            print(f"  ❌  {mid:5} SAĞ KALDI        — {desc}")
+        free: "queue.Queue[Path]" = queue.Queue()
+        for w in pool:
+            free.put(w)
+
+        def task(job):
+            w = free.get()
+            try:
+                return _run_one(w, *job)
+            finally:
+                free.put(w)
+
+        with cf.ThreadPoolExecutor(max_workers=workers) as ex:
+            for kind, mid, desc, extra in ex.map(task, jobs):   # sıra korunur
+                if kind == "caught":
+                    caught.append(mid)
+                    print(f"  ✅  {mid:5} yakalandı        — {desc}", flush=True)
+                elif kind == "survived":
+                    survived.append((mid, desc))
+                    print(f"  ❌  {mid:5} SAĞ KALDI        — {desc}", flush=True)
+                else:
+                    missing.append((mid, desc, extra))
+                    print(f"  ??  {mid:5} HEDEF BULUNAMADI ({extra} eşleşme) — {desc}",
+                          flush=True)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
     total = len(caught) + len(survived) + len(missing)
     print(f"\n  {len(caught)}/{total} mutasyon yakalandı")
