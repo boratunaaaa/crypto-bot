@@ -245,3 +245,165 @@ def test_safe_stop_is_always_before_liquidation():
         sl = safe_stop_loss(entry, "BUY", lev, atr_sl=50.0)   # aşırı geniş ATR stop
         liq = entry * (1 - 1.0 / lev)
         assert sl > liq, "stop likidasyon fiyatının altında kaldı"
+
+
+# ── Haftalık zarar limiti: sayaç değil ölçüm ─────────────────────────────────
+# 2026-08-16 canlı arızası: bot ISO hafta 33'te GERÇEKTE +156.87$ kârdayken,
+# bellekteki `weekly_pnl` sayacı 12 Ağustos restart'ında sıfırlandığı için
+# -128.01$ görüyordu ve 2,5 gün boyunca tek işlem açmadı. Aşağıdaki testler
+# o senaryonun tekrarını engeller.
+
+def test_weekly_source_overrides_stale_counter():
+    """Sayaç zarar diyor ama ölçüm kâr diyorsa bot DURMAMALI."""
+    ks = KillSwitchTracker(EQUITY)
+    ks.initialize(EQUITY)
+    ks.weekly_pnl = -(EQUITY * config.WEEKLY_LOSS_LIMIT_PCT + 50)   # bozuk sayaç
+    assert not ks.can_trade(EQUITY)[0], "önkoşul: sayaç tek başına bloklamalı"
+
+    ks.set_weekly_pnl_source(lambda: +156.87)                        # gerçek ölçüm
+    ok, reason = ks.can_trade(EQUITY)
+    assert ok, f"kârlı haftada bot durduruldu: {reason}"
+
+
+def test_weekly_source_still_halts_on_real_loss():
+    """Ölçüm gerçekten limiti aşan zarar gösteriyorsa kapı KAPANMALI."""
+    ks = KillSwitchTracker(EQUITY)
+    ks.initialize(EQUITY)
+    ks.set_weekly_pnl_source(lambda: -(EQUITY * config.WEEKLY_LOSS_LIMIT_PCT + 1))
+    ok, reason = ks.can_trade(EQUITY)
+    assert not ok and "Haftalık" in reason
+
+
+def test_weekly_falls_back_to_counter_when_source_fails():
+    """Kaynak patlarsa limit sessizce devre dışı kalmamalı — sayaca düşmeli."""
+    def boom():
+        raise RuntimeError("db yok")
+
+    ks = KillSwitchTracker(EQUITY)
+    ks.initialize(EQUITY)
+    ks.set_weekly_pnl_source(boom)
+    ks.weekly_pnl = -(EQUITY * config.WEEKLY_LOSS_LIMIT_PCT + 1)
+    ok, reason = ks.can_trade(EQUITY)
+    assert not ok and "Haftalık" in reason
+
+
+def test_weekly_limit_uses_week_start_not_daily_balance():
+    """Haftalık eşik gün içinde düşen bakiyeyle birlikte DARALMAMALI.
+
+    Hafta 1000$ ile başladı, %10 eşik = 100$. Bakiye 900$'a indi ve yeni gün
+    başladı; `daily_start_balance` 900$ oldu. Eşik hâlâ 100$ olmalı, 90$ değil.
+    """
+    ks = KillSwitchTracker(1000.0)
+    ks.initialize(1000.0)
+    ks.week_start_balance = 1000.0
+    ks.daily_start_balance = 900.0
+    ks.set_weekly_pnl_source(lambda: -95.0)     # 90$'ı aşar ama 100$'ı aşmaz
+    ok, reason = ks.can_trade(900.0)
+    assert ok, f"haftalık eşik günlük bakiyeyle daraldı: {reason}"
+
+
+def test_blocking_reason_does_not_mutate_state():
+    """Raporlama yolu bir durdurmayı sessizce kaldırmamalı."""
+    ks = KillSwitchTracker(EQUITY)
+    ks.initialize(EQUITY)
+    for _ in range(config.MAX_CONSECUTIVE_LOSSES):
+        ks.record_trade_close(-5.0, EQUITY, symbol="X")
+    ks._halted_at = datetime.now() - timedelta(hours=config.KILL_SWITCH_COOLDOWN_HOURS + 1)
+
+    ok, _ = ks.blocking_reason(EQUITY)
+    assert ok, "soğuma dolduysa rapor da serbest demeli"
+    # ...ama sayaçları SIFIRLAMAMALI: karar hâlâ ana döngünün.
+    assert ks.consecutive_losses == config.MAX_CONSECUTIVE_LOSSES
+    assert ks._halted_at is not None
+
+
+def test_week_start_balance_survives_persistence():
+    ks = KillSwitchTracker(1000.0)
+    ks.week_start_balance = 1234.5
+    back = KillSwitchTracker.from_dict(ks.to_dict())
+    assert back.week_start_balance == pytest.approx(1234.5)
+
+
+# ── Drawdown kapısının çıkışı ────────────────────────────────────────────────
+# 2026-08-16: bu kapıda soğuma yoktu ve `high_water_mark` yalnız artıyordu.
+# Bakiye ancak işlemle yükselir, işlem de bu kapıyla kapalı → KALICI kilitlenme.
+
+def _dd_halted(balance=800.0, hwm=1000.0):
+    ks = KillSwitchTracker(1000.0)
+    ks.initialize(1000.0)
+    ks.high_water_mark = hwm
+    ks.set_weekly_pnl_source(lambda: 0.0)
+    ok, reason = ks.can_trade(balance)          # %20 drawdown → durur
+    assert not ok and "drawdown" in reason.lower()
+    return ks
+
+
+def test_drawdown_halts_but_records_start_time():
+    ks = _dd_halted()
+    assert ks._dd_halted_at is not None, "bekleme başlangıcı kaydedilmedi"
+
+
+def test_drawdown_is_not_a_permanent_death_in_paper_mode():
+    """Soğuma dolunca kâğıt modda taban yenilenmeli — aksi hâlde bot ölü kalır."""
+    ks = _dd_halted()
+    ks._dd_halted_at = datetime.now() - timedelta(hours=config.DRAWDOWN_COOLDOWN_HOURS + 1)
+    ok, reason = ks.can_trade(800.0)
+    assert ok, f"drawdown kapısı kalıcı kilitledi: {reason}"
+    assert ks.high_water_mark == pytest.approx(800.0), "taban yenilenmedi"
+    assert ks._dd_halted_at is None
+
+
+def test_drawdown_still_blocks_before_cooldown_elapses():
+    ks = _dd_halted()
+    ks._dd_halted_at = datetime.now() - timedelta(hours=1)
+    ok, reason = ks.can_trade(800.0)
+    assert not ok and "saat sonra" in reason
+
+
+def test_drawdown_wait_survives_restart():
+    """Restart beklemeyi sıfırlarsa kapı her yeniden başlatmada baştan sayar."""
+    ks = _dd_halted()
+    back = KillSwitchTracker.from_dict(ks.to_dict())
+    assert back._dd_halted_at is not None
+
+
+def test_drawdown_wait_cleared_when_equity_recovers():
+    ks = _dd_halted()
+    ks.set_weekly_pnl_source(lambda: 0.0)
+    ok, _ = ks.can_trade(950.0)                 # drawdown %5'e döndü
+    assert ok and ks._dd_halted_at is None
+
+
+def test_blocking_reason_does_not_start_drawdown_clock():
+    """Salt-okunur sorgu bekleme saatini BAŞLATMAMALI."""
+    ks = KillSwitchTracker(1000.0)
+    ks.initialize(1000.0)
+    ks.high_water_mark = 1000.0
+    ks.set_weekly_pnl_source(lambda: 0.0)
+    ok, _ = ks.blocking_reason(800.0)
+    assert not ok
+    assert ks._dd_halted_at is None, "rapor yolu durum değiştirdi"
+
+
+def test_live_mode_never_auto_recovers_from_drawdown(monkeypatch):
+    """GERÇEK modda drawdown kapısı kendi kendine açılmamalı.
+
+    Kâğıt modda taban yenilemek doğrudur (durmuş bir kâğıt bot hiç veri
+    üretmez). Gerçek parada aynı davranış, %20 kaybettikten sonra botu hiçbir
+    insan bakmadan tekrar piyasaya sokar — ve bunu her seferinde yeniden yapar.
+    """
+    import risk_manager
+    monkeypatch.setattr(risk_manager, "PAPER_TRADING", False)
+
+    ks = KillSwitchTracker(1000.0)
+    ks.initialize(1000.0)
+    ks.high_water_mark = 1000.0
+    ks.set_weekly_pnl_source(lambda: 0.0)
+    assert not ks.can_trade(800.0)[0]
+
+    # Soğuma fazlasıyla dolmuş olsa bile açılmamalı.
+    ks._dd_halted_at = datetime.now() - timedelta(hours=config.DRAWDOWN_COOLDOWN_HOURS * 10)
+    ok, reason = ks.can_trade(800.0)
+    assert not ok, "gerçek modda drawdown otomatik kurtarıldı"
+    assert "elle müdahale" in reason
+    assert ks.high_water_mark == pytest.approx(1000.0), "gerçek modda taban yenilendi"

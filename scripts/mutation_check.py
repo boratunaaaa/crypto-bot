@@ -283,6 +283,43 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     ("M52", "trader.py", "Restart doğrulaması genel timeout'u dışarı taşır",
      'except Exception as e:\n            # Borsayı okuyamıyorsak hiçbir şeyi doğrulanmış sayamayız.',
      'except BinanceAPIException as e:\n            # Borsayı okuyamıyorsak hiçbir şeyi doğrulanmış sayamayız.'),
+
+    # ── 2026-08-16: sessiz kilitler ──────────────────────────────────────────
+    ("M53", "risk_manager.py", "Haftalık limit ölçüm yerine bozuk sayaca bakar",
+     'wpnl = self.effective_weekly_pnl()',
+     'wpnl = self.weekly_pnl'),
+
+    ("M54", "risk_manager.py", "Haftalık eşik hafta başı yerine gün başı bakiyeye bakar",
+     'wref = self.week_start_balance if self.week_start_balance > 0 else ref',
+     'wref = ref'),
+
+    ("M55", "risk_manager.py", "Ölçüm kaynağı yok sayılır (sayaç geri döner)",
+     'if self._weekly_source is not None:',
+     'if False:'),
+
+    ("M56", "risk_manager.py", "Kaynak patlayınca haftalık limit sessizce devre dışı kalır",
+     'except Exception:\n                pass  # kaynak okunamadıysa sessizce sayaca düş\n        return self.weekly_pnl',
+     'except Exception:\n                pass  # kaynak okunamadıysa sessizce sayaca düş\n        return 0.0'),
+
+    ("M57", "risk_manager.py", "Rapor yolu durum değiştirir (durdurmayı sessizce kaldırır)",
+     'return self._evaluate(balance, strategy, mutate=False)',
+     'return self._evaluate(balance, strategy, mutate=True)'),
+
+    ("M58", "risk_manager.py", "Drawdown kapısı yine kalıcı ölüm olur",
+     'if elapsed_h >= DRAWDOWN_COOLDOWN_HOURS and auto_ok:',
+     'if False:'),
+
+    ("M59", "risk_manager.py", "Drawdown beklemesi hiç başlatılmaz (soğuma asla dolmaz)",
+     'if mutate:\n                    self._dd_halted_at = datetime.now()',
+     'if False:\n                    self._dd_halted_at = datetime.now()'),
+
+    ("M60", "risk_manager.py", "Gerçek modda drawdown otomatik kurtarılır",
+     'auto_ok = PAPER_TRADING and DRAWDOWN_AUTO_REBASE_PAPER',
+     'auto_ok = True'),
+
+    ("M61", "database.py", "Haftalık PnL penceresi hafta yerine tüm geçmişi sayar",
+     'AND close_time >= ? AND close_time < ?")',
+     'AND close_time >= ? AND close_time < ? OR 1=1")'),
 ]
 
 

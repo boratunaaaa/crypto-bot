@@ -111,6 +111,20 @@ MAX_DRAWDOWN_PCT       = 0.20   # tepe bakiyeden %20 düşüş → tam durdurma
 MAX_CONSECUTIVE_LOSSES = 4
 KILL_SWITCH_COOLDOWN_HOURS = 2
 
+# ─── Drawdown kapısının çıkışı ────────────────────────────────────────────────
+# DENETİM BULGUSU (2026-08-16): drawdown kapısında soğuma YOKTU ve
+# `high_water_mark` yalnız artıyordu. Bakiye ancak işlemle yükselir, işlem de bu
+# kapıyla kapalı — yani kapı bir kez bağlayınca bot KALICI olarak ölüyordu ve
+# (nabız mesajı düzeltilene kadar) bunu kimseye söylemiyordu. Bu, aynı hafta
+# haftalık zarar limitinde yaşanan sessiz kilidin birebir aynısı.
+#
+# Kapının DURDURMASI doğru; kalıcı ve sessiz olması yanlış. Bu yüzden:
+#   • kâğıt modda soğuma dolunca taban bir kez yenilenir ve ölçüm sürer
+#     (durmuş bir kâğıt bot hiç veri üretmez — en kötü sonuç budur),
+#   • GERÇEK modda otomatik kurtarma YOKTUR; insan bakana kadar durur.
+DRAWDOWN_COOLDOWN_HOURS    = 12
+DRAWDOWN_AUTO_REBASE_PAPER = True
+
 # Aynı sembolde arka arkaya işlem açmadan önce bekleme (dakika)
 SYMBOL_COOLDOWN_MIN    = 30
 

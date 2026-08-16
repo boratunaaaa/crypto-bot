@@ -1,5 +1,9 @@
 # Sürümler SABİT: aynı kurulum ileride farklı davranmasın.
 # Güncellerken testleri çalıştır (pytest -q).
+# DENETİM (2026-08-16): `python-binance` listede yoktu ama main/trader/
+# market_data/data_feed/backtest hepsi ondan import ediyor. Temiz bir makinede
+# bu dosyadan kurulum yapmak çalışmayan bir bot üretirdi.
+python-binance==1.0.19
 numpy==2.2.6
 pandas-ta==0.4.71b0
 pandas==3.0.5

@@ -37,6 +37,7 @@ from config import (
     RISK_PER_TRADE_PCT, RISK_PER_TRADE_STRONG_PCT, STRONG_SIGNAL_SCORE,
     DAILY_LOSS_LIMIT_PCT, WEEKLY_LOSS_LIMIT_PCT, MAX_DRAWDOWN_PCT,
     MAX_CONSECUTIVE_LOSSES,
+    DRAWDOWN_COOLDOWN_HOURS, DRAWDOWN_AUTO_REBASE_PAPER, PAPER_TRADING,
     DAILY_RISK_BUDGET_R, RISK_BUDGET_REFUND, MAX_DAILY_TRADES_HARD,
     MAX_PORTFOLIO_RISK_R, SYMBOL_COOLDOWN_MIN,
     DYNAMIC_RISK_ENABLED, RISK_MIN_PCT, RISK_MAX_PCT, DYNAMIC_RISK_LOOKBACK,
@@ -65,13 +66,46 @@ class KillSwitchTracker:
         self.daily_trades       = 0
         self.consecutive_losses = 0
         self.daily_start_balance = initial_balance
+        self.week_start_balance  = initial_balance
         self.high_water_mark    = initial_balance
         self.daily_risk_used_r  = 0.0
         self.momentum_risk_used_r = 0.0
         self._last_day  = datetime.now().date()
         self._last_week = datetime.now().isocalendar()[1]
         self._halted_at: datetime | None = None
+        # Drawdown kapısının bekleme başlangıcı. Kalıcı: restart bu beklemeyi
+        # sıfırlarsa kapı her yeniden başlatmada baştan sayar.
+        self._dd_halted_at: datetime | None = None
         self._symbol_cooldown: dict[str, datetime] = {}
+        # Haftalık PnL'in otoriter kaynağı (bkz. effective_weekly_pnl).
+        self._weekly_source = None
+
+    # ── Haftalık PnL: sayaç değil, ölçüm ──────────────────────────────────────
+
+    def set_weekly_pnl_source(self, fn) -> None:
+        """Haftalık gerçekleşmiş PnL'i döndüren callable bağla (None = sayaç).
+
+        Kaynak, kapanmış işlemleri diskten okur. Bellekteki `weekly_pnl` sayacı
+        yedek olarak kalır ama artık karar mercii değildir.
+        """
+        self._weekly_source = fn
+
+    def effective_weekly_pnl(self) -> float:
+        """Kararlarda kullanılan haftalık PnL.
+
+        DENETİM BULGUSU (2026-08-16): sayaç 12 Ağustos restart'ında haftanın
+        +284.88$'lık kârını kaybetti ve sonrasında biriken -128.01$ yüzünden bot
+        KÂRDA olduğu bir haftada 2,5 gün boyunca hiç işlem açmadı. Sayaç bir
+        varsayımdır; kapanmış işlemler ölçümdür. Ölçüm varsa o kullanılır.
+        """
+        if self._weekly_source is not None:
+            try:
+                v = self._weekly_source()
+                if v is not None:
+                    return float(v)
+            except Exception:
+                pass  # kaynak okunamadıysa sessizce sayaca düş
+        return self.weekly_pnl
 
     # ── Gün/hafta devri ───────────────────────────────────────────────────────
 
@@ -88,6 +122,8 @@ class KillSwitchTracker:
         if week != self._last_week:
             self.weekly_pnl  = 0.0
             self._last_week  = week
+            # Haftalık limitin referansı HAFTA BAŞI bakiyesidir.
+            self.week_start_balance = balance
 
     def initialize(self, balance: float):
         if self.daily_start_balance <= 0:
@@ -171,21 +207,67 @@ class KillSwitchTracker:
         cap = DAILY_RISK_BUDGET_R * MOMENTUM_RISK_SHARE
         return max(0.0, cap - self.momentum_risk_used_r)
 
+    def blocking_reason(self, balance: float, strategy: str = "TREND") -> tuple[bool, str]:
+        """`can_trade` ile aynı kararı verir ama HİÇBİR durumu değiştirmez.
+
+        Raporlama/bildirim yolları bunu kullanmalı. `can_trade` gün devrini
+        işler ve soğuma dolmuşsa `consecutive_losses`/`_halted_at` alanlarını
+        SIFIRLAR; bunu nabız thread'inden çağırmak, ana döngüyle yarışıp bir
+        durdurmayı sessizce kaldırabilirdi.
+        """
+        return self._evaluate(balance, strategy, mutate=False)
+
     def can_trade(self, balance: float, strategy: str = "TREND") -> tuple[bool, str]:
         self._reset_if_needed(balance)
+        return self._evaluate(balance, strategy, mutate=True)
+
+    def _evaluate(self, balance: float, strategy: str, mutate: bool) -> tuple[bool, str]:
         ref = self.daily_start_balance if self.daily_start_balance > 0 else balance
 
-        # Drawdown — en sert koruma, her şeyin önünde
+        # Drawdown — en sert koruma, her şeyin önünde.
+        # Durdurur, ama artık KALICI olarak değil: çıkışı tanımlı (bkz. config).
         dd = self.current_drawdown(balance)
         if dd >= MAX_DRAWDOWN_PCT:
-            return False, f"Maksimum drawdown aşıldı (%{dd*100:.1f})"
+            if self._dd_halted_at is None:
+                if mutate:
+                    self._dd_halted_at = datetime.now()
+                return False, (
+                    f"Maksimum drawdown aşıldı (%{dd*100:.1f}) — "
+                    f"{DRAWDOWN_COOLDOWN_HOURS:.0f} saat beklemede"
+                )
+
+            elapsed_h = (datetime.now() - self._dd_halted_at).total_seconds() / 3600
+            auto_ok = PAPER_TRADING and DRAWDOWN_AUTO_REBASE_PAPER
+            if elapsed_h >= DRAWDOWN_COOLDOWN_HOURS and auto_ok:
+                # Tabanı yenile: aksi hâlde bakiye asla toparlanamaz, çünkü
+                # toparlanmanın tek yolu olan işlem bu kapıyla kapalı.
+                if mutate:
+                    self.high_water_mark = balance
+                    self._dd_halted_at = None
+                return True, "OK (drawdown tabanı kâğıt modda yenilendi)"
+
+            if not auto_ok:
+                return False, (
+                    f"Maksimum drawdown aşıldı (%{dd*100:.1f}) — "
+                    f"GERÇEK mod: elle müdahale gerekiyor"
+                )
+            kalan = DRAWDOWN_COOLDOWN_HOURS - elapsed_h
+            return False, (
+                f"Maksimum drawdown aşıldı (%{dd*100:.1f}) — "
+                f"{kalan:.1f} saat sonra taban yenilenecek"
+            )
+
+        # Drawdown eşiğin altına kendiliğinden döndüyse bekleme iptal.
+        if self._dd_halted_at is not None and mutate:
+            self._dd_halted_at = None
 
         if self.consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
             if self._halted_at is not None:
                 elapsed_h = (datetime.now() - self._halted_at).total_seconds() / 3600
                 if elapsed_h >= KILL_SWITCH_COOLDOWN_HOURS:
-                    self.consecutive_losses = 0
-                    self._halted_at = None
+                    if mutate:
+                        self.consecutive_losses = 0
+                        self._halted_at = None
                     return True, "OK (soğuma doldu, yeniden başlandı)"
                 kalan = KILL_SWITCH_COOLDOWN_HOURS - elapsed_h
                 return False, (
@@ -210,8 +292,15 @@ class KillSwitchTracker:
 
         if self.daily_pnl <= -(ref * DAILY_LOSS_LIMIT_PCT):
             return False, f"Günlük zarar limiti ({self.daily_pnl:.2f}$)"
-        if self.weekly_pnl <= -(ref * WEEKLY_LOSS_LIMIT_PCT):
-            return False, f"Haftalık zarar limiti ({self.weekly_pnl:.2f}$)"
+
+        # Haftalık limitin referansı HAFTA BAŞI bakiyesi — günlük referans
+        # kullanmak eşiği kayan bir cendereye çevirir: hafta kötü giderken
+        # `daily_start_balance` her sabah düşer, dolayısıyla "%10 haftalık
+        # zarar" eşiği de düşer ve limit ilan edilenden ERKEN bağlar.
+        wref = self.week_start_balance if self.week_start_balance > 0 else ref
+        wpnl = self.effective_weekly_pnl()
+        if wpnl <= -(wref * WEEKLY_LOSS_LIMIT_PCT):
+            return False, f"Haftalık zarar limiti ({wpnl:.2f}$)"
         return True, "OK"
 
     # ── Kalıcılık ─────────────────────────────────────────────────────────────
@@ -223,12 +312,14 @@ class KillSwitchTracker:
             "daily_trades": self.daily_trades,
             "consecutive_losses": self.consecutive_losses,
             "daily_start_balance": self.daily_start_balance,
+            "week_start_balance": self.week_start_balance,
             "high_water_mark": self.high_water_mark,
             "daily_risk_used_r": self.daily_risk_used_r,
             "momentum_risk_used_r": self.momentum_risk_used_r,
             "last_day": self._last_day.isoformat(),
             "last_week": self._last_week,
             "halted_at": self._halted_at.isoformat() if self._halted_at else None,
+            "dd_halted_at": self._dd_halted_at.isoformat() if self._dd_halted_at else None,
             "symbol_cooldown": {
                 k: v.isoformat() for k, v in self._symbol_cooldown.items()
             },
@@ -242,6 +333,10 @@ class KillSwitchTracker:
         ks.daily_trades        = d.get("daily_trades", 0)
         ks.consecutive_losses  = d.get("consecutive_losses", 0)
         ks.daily_start_balance = d.get("daily_start_balance", 0.0)
+        # Eski state'lerde bu alan yok: hafta başı referansı bilinmiyorsa
+        # günlük referansa düşmek, 0'a düşüp limiti tamamen devre dışı
+        # bırakmaktan güvenlidir.
+        ks.week_start_balance  = d.get("week_start_balance") or ks.daily_start_balance
         ks.high_water_mark     = d.get("high_water_mark", 0.0)
         ks.daily_risk_used_r   = d.get("daily_risk_used_r", 0.0)
         ks.momentum_risk_used_r= d.get("momentum_risk_used_r", 0.0)
@@ -252,6 +347,8 @@ class KillSwitchTracker:
         ks._last_week = d.get("last_week", datetime.now().isocalendar()[1])
         ha = d.get("halted_at")
         ks._halted_at = datetime.fromisoformat(ha) if ha else None
+        dha = d.get("dd_halted_at")
+        ks._dd_halted_at = datetime.fromisoformat(dha) if dha else None
         ks._symbol_cooldown = {}
         for k, v in (d.get("symbol_cooldown") or {}).items():
             try:

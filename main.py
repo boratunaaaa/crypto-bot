@@ -46,6 +46,7 @@ from database import (
     state_get, state_set_many, load_open_positions, save_open_positions,
     save_shadow_signal, save_equity_snapshot,
     get_pending_shadow_signals, update_shadow_outcome,
+    get_week_realized_pnl,
 )
 from telegram_bot import TelegramBot
 import momentum as momentum_mod
@@ -122,6 +123,18 @@ def run():
         )
     else:
         kill_switch = KillSwitchTracker()
+
+    # Haftalık zarar limiti artık bellekteki sayaca değil, kapanmış işlemlere
+    # bakıyor. Sayaç bir restart'ta sıfırlandığında bot KÂRDA olduğu bir haftada
+    # kendini günlerce durdurmuştu; ölçüm bu sınıf hatayı yapısal olarak keser.
+    kill_switch.set_weekly_pnl_source(get_week_realized_pnl)
+    _wk_measured = get_week_realized_pnl()
+    if _wk_measured is not None and abs(_wk_measured - kill_switch.weekly_pnl) > 0.01:
+        logger.warning(
+            f"Haftalık PnL sayacı sapmış: sayaç {kill_switch.weekly_pnl:+.2f}$, "
+            f"ölçüm {_wk_measured:+.2f}$ — ölçüm esas alınıyor"
+        )
+        kill_switch.weekly_pnl = _wk_measured
 
     def _save_state():
         """Tüm kritik state'i diske yaz. Her işlem sonrası + periyodik çağrılır."""
@@ -428,12 +441,26 @@ def run():
             if HEARTBEAT_ENABLED and (now - last_beat) / 60 >= HEARTBEAT_INTERVAL_MIN:
                 last_beat = now
                 eq = _equity()
+
+                # "Yaşıyorum" demek yetmiyor: bot 2,5 gün boyunca kill switch
+                # yüzünden hiç işlem açmadığı hâlde bu mesaj her saat sağlıklı
+                # görünüyordu. Nabız, KALP ATIYOR MU değil, İŞ YAPIYOR MU
+                # sorusunu cevaplamalı — engel varsa sebebi burada görünür.
+                try:
+                    # Salt-okunur: nabız thread'i ana döngünün durumunu bozmamalı.
+                    ok_now, why = kill_switch.blocking_reason(eq)
+                except Exception as e:
+                    ok_now, why = False, f"durum okunamadı ({e})"
+                head = "💓 <b>Yaşıyorum</b>" if ok_now else "⛔️ <b>Yaşıyorum ama İŞLEM AÇMIYORUM</b>"
+                blocked = "" if ok_now else f"\n<b>Sebep:</b> {why}"
+
                 tg.send(
-                    f"💓 <b>Yaşıyorum</b>\n"
+                    f"{head}{blocked}\n"
                     f"Equity: {eq:.2f}$ | PnL: {getattr(trader,'total_pnl',0):+.2f}$\n"
                     f"Açık: {len(trader.positions)} | "
                     f"Risk: {kill_switch.daily_risk_used_r:.1f}R/{DAILY_RISK_BUDGET_R:.0f}R\n"
-                    f"Günlük: {kill_switch.daily_pnl:+.2f}$ ({kill_switch.daily_trades} işlem)"
+                    f"Günlük: {kill_switch.daily_pnl:+.2f}$ ({kill_switch.daily_trades} işlem)\n"
+                    f"Haftalık: {kill_switch.effective_weekly_pnl():+.2f}$"
                 )
 
     threading.Thread(target=_heartbeat, daemon=True, name="heartbeat").start()
@@ -512,6 +539,8 @@ def run():
     last_ticker       = time.time()
     last_state_save   = 0.0
     _ks_notified      = False
+    _ks_last_reason   = ""
+    _ks_last_log      = 0.0
     _guard_notified: dict = {}
     last_shadow_eval  = 0.0
     # symbol -> o işleme ayrılan R (bütçe iadesini sınırlamak için)
@@ -642,7 +671,16 @@ def run():
             kill_switch.observe_equity(equity)
             can_trade, ks_reason = kill_switch.can_trade(equity)
             if not can_trade:
-                logger.warning(f"KİLL SWİTCH: {ks_reason}")
+                # Aynı satırı her turda yazmak logu şişiriyordu: tek bir
+                # kilitte 2,5 günde 7.154 özdeş satır. Sebep değiştiğinde ya da
+                # 15 dakikada bir yaz — kilidin sürdüğü görünür kalsın ama log
+                # okunabilir olsun (bu sunucuda log şişmesi daha önce yaşandı).
+                _now_ts = time.time()
+                if (ks_reason != _ks_last_reason
+                        or _now_ts - _ks_last_log >= 900):
+                    logger.warning(f"KİLL SWİTCH: {ks_reason}")
+                    _ks_last_reason = ks_reason
+                    _ks_last_log = _now_ts
                 if not _ks_notified:
                     tg.notify_kill_switch(ks_reason)
                     _ks_notified = True

@@ -13,7 +13,7 @@ import json
 import os
 import sqlite3
 import logging
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from pathlib import Path
 
 logger = logging.getLogger("database")
@@ -599,6 +599,50 @@ def get_recent_pnls(n: int = 30) -> list[float]:
             return out
     except Exception:
         return []
+
+
+def get_week_realized_pnl(now: datetime | None = None) -> float | None:
+    """İÇİNDE BULUNULAN ISO haftasının gerçekleşmiş net PnL'i — otoriter kaynak.
+
+    DENETİM BULGUSU (2026-08-16): `KillSwitchTracker.weekly_pnl` bellekte tutulan
+    ham bir sayaçtı ve yalnız ISO hafta devrinde sıfırlanıyordu. 12 Ağustos
+    restart'ında kaydedilmiş state'te bu alan yoktu, `from_dict` 0.0'a düştü ve
+    sayaç haftanın gerçek kârını (+284.88$) kaybetti. Sonrasında biriken
+    -128.01$ "haftalık zarar" sanıldı; oysa hafta 33 gerçekte +156.87$ KÂRDAydı.
+    Bot kârlı bir haftada kendini 2,5 gün durdurdu.
+
+    Sayaç ile gerçek arasındaki her sapma bu şekilde sessiz bir kilide dönüşür.
+    Çözüm sayacı yamalamak değil, tek doğru kaynağı sormak: kapanmış işlemler
+    zaten diskte. Bu fonksiyon restart'tan, sayaç sıfırlanmasından ve şema
+    değişikliğinden BAĞIMSIZ olarak doğru sonucu verir.
+
+    `mode` filtresi zorunlu: kâğıt ve gerçek mod PnL'i asla karışmamalı.
+    Sorgu başarısız olursa None döner — çağıran taraf sayaca geri düşer.
+    """
+    ref = now or datetime.now()
+    year, week, _ = ref.isocalendar()
+    # ISO haftanın pazartesi 00:00'ı ile ertesi pazartesi 00:00'ı arası.
+    monday = datetime.fromisocalendar(year, week, 1)
+    next_monday = monday + timedelta(days=7)
+    try:
+        with _conn() as con:
+            # `mode` sütunu eski veritabanlarında yok. Sorguyu ona koşulsuz
+            # bağlamak, bu fonksiyonun sessizce None dönmesine ve çağıranın
+            # BOZUK sayaca geri düşmesine yol açardı — yani düzeltmenin kendisi
+            # düzeltmek istediği kilidi yeniden kurardı.
+            cols = {r[1] for r in con.execute("PRAGMA table_info(trades)")}
+            sql = ("SELECT COALESCE(SUM(net_pnl), 0.0) AS s FROM trades "
+                   "WHERE close_time IS NOT NULL "
+                   "AND close_time >= ? AND close_time < ?")
+            params: list = [monday.isoformat(), next_monday.isoformat()]
+            if "mode" in cols:
+                sql += " AND COALESCE(mode, 'paper') = ?"
+                params.append(_mode())
+            row = con.execute(sql, tuple(params)).fetchone()
+            return float(row["s"] or 0.0)
+    except Exception as e:
+        logger.warning(f"Haftalık PnL okunamadı, sayaca düşülüyor: {e}")
+        return None
 
 
 def get_performance_summary(strategy: str | None = None) -> dict:

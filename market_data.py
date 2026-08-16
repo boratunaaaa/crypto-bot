@@ -59,6 +59,10 @@ class MarketDataManager:
         self._twm:        ThreadedWebsocketManager | None = None
         self._running     = False
         self._last_ws_msg = time.time()
+        # Mesaj akıyor ama hiçbiri fiyata dönüşmüyorsa bu bir FORMAT hatasıdır,
+        # ağ hatası değil. İkisi ayrı ölçülmezse arıza sessiz kalır.
+        self._last_price_update = time.time()
+        self._fmt_alerted = False
 
         self._last_coin_refresh   = 0.0
         self._last_funding_refresh= 0.0
@@ -275,6 +279,49 @@ class MarketDataManager:
             pass
         time.sleep(1)
 
+    def _ingest_ticker(self, item, now: float) -> int:
+        """Tek bir ticker kaydını işle. Dönen değer: güncellenen sembol sayısı.
+
+        İki format da desteklenir:
+          • miniTicker / 24h ticker → `c` (son fiyat)
+          • bookTicker              → `b`/`a` (alış/satış), orta fiyat alınır
+        Orta fiyat giriş kararı için son işlem fiyatından daha dürüsttür:
+        gerçekte alınabilecek fiyata daha yakındır.
+
+        Çağıran `self._lock`'u tutuyor olmalı.
+        """
+        if not isinstance(item, dict):
+            return 0
+        sym = item.get("s")
+        if not sym:
+            return 0
+
+        price = item.get("c")
+        if price is None:
+            bid, ask = item.get("b"), item.get("a")
+            if bid is not None and ask is not None:
+                try:
+                    b, a = float(bid), float(ask)
+                except (TypeError, ValueError):
+                    return 0
+                if b <= 0 or a <= 0:
+                    return 0
+                price = (b + a) / 2.0
+                self._spread[sym] = (a - b) / price if price else 0.0
+        if price is None:
+            return 0
+
+        try:
+            px = float(price)
+        except (TypeError, ValueError):
+            return 0
+        if px <= 0:
+            return 0
+
+        self._prices[sym] = px
+        self._price_ts[sym] = now
+        return 1
+
     def _start_ws(self):
         self._stop_twm()
         try:
@@ -283,16 +330,34 @@ class MarketDataManager:
             time.sleep(1)
 
             def on_ticker(msg):
-                if isinstance(msg, list):
-                    now = time.time()
-                    self._last_ws_msg = now
-                    with self._lock:
-                        for item in msg:
-                            sym = item.get("s")
-                            price = item.get("c")
-                            if sym and price:
-                                self._prices[sym] = float(price)
-                                self._price_ts[sym] = now
+                # DENETİM BULGUSU (2026-08-16, canlı): burada yalnız
+                # `isinstance(msg, list)` işleniyordu ve yalnız `c` alanı
+                # okunuyordu. Futures akışında ÜÇ varsayım da yanlış:
+                #   1. Mesaj liste değil, {'stream':..., 'data':...} sarmalı,
+                #   2. `data` bir ticker DİZİSİ değil, TEK bir kayıt,
+                #   3. python-binance'in `start_all_ticker_futures_socket`'i
+                #      aslında `!bookTicker`'a abone olur — orada `c` (son
+                #      fiyat) YOKTUR, `b`/`a` (alış/satış) vardır.
+                # Sonuç: futures modunda `_prices` HİÇ dolmadı. Yeni eklenen
+                # tazelik kontrolüyle birleşince her giriş "Fiyat bayat"
+                # gerekçesiyle reddedildi ve bot hiç işlem açamadı.
+                now = time.time()
+                # Bağlantı sağlığı: mesaj GELDİYSE hat ayakta. Bunu ayrıştırma
+                # başarısına bağlamak, format değişiminde watchdog'u sonsuz ve
+                # faydasız bir yeniden bağlanma döngüsüne sokuyordu.
+                self._last_ws_msg = now
+
+                payload = msg
+                if isinstance(payload, dict) and "data" in payload:
+                    payload = payload["data"]
+                items = payload if isinstance(payload, list) else [payload]
+
+                updated = 0
+                with self._lock:
+                    for item in items:
+                        updated += self._ingest_ticker(item, now)
+                if updated:
+                    self._last_price_update = now
 
             # DENETİM BULGUSU (kritik): burada `start_miniticker_socket`
             # kullanılıyordu — o python-binance'te SPOT akışıdır. Futures botu
@@ -308,6 +373,8 @@ class MarketDataManager:
                 stream = "futures ticker"
             self._twm = twm
             self._last_ws_msg = time.time()
+            self._last_price_update = time.time()
+            self._fmt_alerted = False
             logger.info(f"WebSocket başlatıldı ({stream})")
         except Exception as e:
             logger.error(f"WebSocket başlatma hatası: {e}")
@@ -320,7 +387,22 @@ class MarketDataManager:
             if not self._running:
                 break
             age = time.time() - self._last_ws_msg
+
+            # Hat ayakta ama fiyat üretmiyorsa sorun ağ DEĞİL, ayrıştırmadır.
+            # Yeniden bağlanmak bunu çözmez; tam olarak bu ayrımı yapmadığımız
+            # için bot saatlerce boşuna reconnect döngüsünde kaldı ve tek işlem
+            # açmadı. Bu durum ayrı ve YÜKSEK sesle raporlanır.
             if age <= 60:
+                stale = time.time() - self._last_price_update
+                if stale > 120 and not self._fmt_alerted:
+                    logger.error(
+                        f"WebSocket mesaj gönderiyor ama {stale:.0f}s'dir hiçbiri "
+                        f"fiyata dönüşmedi — akış formatı değişmiş olabilir. "
+                        f"Giriş kararları bayat fiyat yüzünden durur."
+                    )
+                    self._fmt_alerted = True
+                elif stale <= 120:
+                    self._fmt_alerted = False
                 continue
 
             logger.warning(f"WebSocket {age:.0f}s sessiz — ağ kontrol ediliyor...")
