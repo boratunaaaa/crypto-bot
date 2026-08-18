@@ -234,7 +234,14 @@ MIN_CONFIDENCE   = 0.72
 # Ayrı, izole momentum motoru. Kendi risk bütçesi var; kötüyse tek satırla
 # kapatılır, ana TREND stratejisini kirletmez.
 MOMENTUM_ENABLED       = True
-MOMENTUM_SHADOW_MODE   = True   # True → sinyal üretir + loglar ama İŞLEM AÇMAZ
+MOMENTUM_SHADOW_MODE   = False  # False → KENDİ portföyüyle işlem açar (2026-08-18)
+# MOMENTUM'un ayrı sanal sermayesi. TREND'in kasasından BAĞIMSIZ: ortak kasada
+# birinin zararı diğerinin risk bütçesini küçültür, biri pozisyon limitini
+# doldurunca diğeri sinyal üretse de işlem açamaz — o zaman ölçtüğümüz şey
+# "hangi strateji iyi" değil "hangisi önce davrandı" olurdu.
+#
+# TREND ile AYNI başlangıç sermayesi: karşılaştırma ancak eşit koşulda anlamlı.
+MOMENTUM_BALANCE       = 1000.0
 MOMENTUM_RISK_SHARE    = 0.30   # günlük risk bütçesinin en fazla %30'unu kullanır
 MOMENTUM_MIN_SCORE     = 70
 

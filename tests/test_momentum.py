@@ -238,11 +238,29 @@ def test_scan_sorts_by_score_descending():
 
 # ── Gölge mod ─────────────────────────────────────────────────────────────────
 
-def test_shadow_mode_is_default_on():
+def test_golgeden_cikan_strateji_KENDI_sermayesiyle_calisir():
+    """Eski hâli "gölge mod açık olmalı" diyordu; gerekçesi şuydu: bu strateji
+    hiç ölçülmedi, ölçülmeden ORTAK kasayı riske atmasın.
+
+    2026-08-18'de gölge moddan çıkarıldı — ama gerekçe ortadan kalkmadı,
+    KARŞILANDI: artık kendi sanal sermayesiyle çalışıyor, TREND'in kasasına
+    dokunmuyor. Test o yüzden silinmedi, değişmezi güncellendi.
+
+    Korunan kural: MOMENTUM işlem açıyorsa AYRI ve pozitif bir sermayesi
+    olmalı. Aksi hâlde ölçülmemiş bir strateji ölçülmüş olanın parasını harcar
+    ve iki stratejinin sonucu birbirine karışır.
     """
-    Bu strateji henüz hiç ölçülmedi — varsayılan olarak işlem AÇMAMALI.
-    """
-    assert config.MOMENTUM_SHADOW_MODE is True
+    if config.MOMENTUM_SHADOW_MODE:
+        return  # gölgedeyse işlem açmıyor, sermaye sorusu doğmuyor
+
+    assert hasattr(config, "MOMENTUM_BALANCE"), (
+        "MOMENTUM gölgeden çıkarıldı ama kendi sermayesi tanımlanmamış — "
+        "ortak kasadan harcar"
+    )
+    assert config.MOMENTUM_BALANCE > 0
+    assert config.MOMENTUM_BALANCE == config.PAPER_BALANCE, (
+        "karşılaştırma ancak eşit başlangıç sermayesiyle anlamlı"
+    )
 
 
 def test_shadow_signal_persists():

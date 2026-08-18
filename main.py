@@ -20,7 +20,7 @@ _BOT_DIR = Path(__file__).parent
 from config import (
     PAPER_TRADING, SIGNAL_INTERVAL, POSITION_CHECK_INTERVAL,
     MAX_CORRELATED_POSITIONS, MIN_CONFIDENCE, MIN_MARGIN_USDT, PAPER_BALANCE,
-    MOMENTUM_ENABLED, MOMENTUM_SHADOW_MODE, MOMENTUM_MIN_SCORE,
+    MOMENTUM_ENABLED, MOMENTUM_SHADOW_MODE, MOMENTUM_MIN_SCORE, MOMENTUM_BALANCE,
     HEARTBEAT_ENABLED, HEARTBEAT_INTERVAL_MIN, STALE_ALERT_MINUTES,
     DAILY_RISK_BUDGET_R, MAX_SPREAD_PCT, MAX_PRICE_AGE_SEC,
     CORRELATION_GUARD_ENABLED, MAX_NET_DIRECTIONAL_R,
@@ -38,6 +38,7 @@ from risk_manager import (
     allocated_r,
 )
 from trader import create_trader, PaperPortfolio
+from portfolios import StrategyBook
 from dashboard import build_layout
 from sentiment import SentimentTracker
 from database import (
@@ -131,7 +132,35 @@ def run():
                 f"PnL {trader.total_pnl:+.2f}$, {trader.wins}W/{trader.losses}L"
             )
 
-    n_restored = trader.restore_positions(load_open_positions())
+    n_restored = trader.restore_positions(load_open_positions("TREND"))
+
+    # ── MOMENTUM: kendi portföyü ───────────────────────────────────────────
+    # Gölge moddan çıkıp AYRI sanal sermayeyle işlem açıyor. TREND'in defterine
+    # dokunulmuyor: onun state anahtarları ve pozisyonları olduğu gibi kaldı.
+    #
+    # Neden ayrı portföy: ortak kasada MOMENTUM'un zararı TREND'in sermayesini
+    # küçültür, biri pozisyon limitini doldurunca diğeri sinyal üretse de işlem
+    # açamaz. O zaman ölçtüğümüz şey "hangi strateji iyi" değil, "hangisi önce
+    # davrandı" olurdu.
+    mom_book = StrategyBook("MOMENTUM_FAST", PaperPortfolio(MOMENTUM_BALANCE))
+    if PAPER_TRADING and MOMENTUM_ENABLED and not MOMENTUM_SHADOW_MODE:
+        vardi = mom_book.restore()
+        logger.info(
+            f"MOMENTUM portföyü {'geri yüklendi' if vardi else 'ilk kez kuruldu'}: "
+            f"{mom_book.portfolio.balance:.2f}$, "
+            f"{len(mom_book.portfolio.positions)} açık pozisyon"
+        )
+
+    def book_of(strategy: str):
+        """Stratejinin portföyü. Bilinmeyen strateji TREND'e düşer.
+
+        Gerçek modda çoklu portföy YOK: deney kâğıt üzerinde yürüyor ve gerçek
+        para yolunu bu refactor'a maruz bırakmak gereksiz risk.
+        """
+        if (strategy == "MOMENTUM_FAST" and PAPER_TRADING
+                and MOMENTUM_ENABLED and not MOMENTUM_SHADOW_MODE):
+            return mom_book.portfolio
+        return trader
 
     ks_saved = state_get("kill_switch")
     if ks_saved:
@@ -172,7 +201,10 @@ def run():
                     "losses":           trader.losses,
                 })
             state_set_many(payload)
-            save_open_positions(trader.positions)
+            save_open_positions(trader.positions, strategy="TREND")
+            # MOMENTUM ayrı defter: kendi satırlarına yazar, TREND'inkine dokunmaz.
+            if mom_book.portfolio.positions or mom_book.portfolio.total_pnl:
+                mom_book.save()
         except Exception as e:
             logger.error(f"State kaydedilemedi: {e}")
 
@@ -563,9 +595,14 @@ def run():
     _ks_last_log      = 0.0
     _guard_notified: dict = {}
     last_shadow_eval  = 0.0
-    # symbol -> o işleme ayrılan R (bütçe iadesini sınırlamak için)
-    _alloc_of: dict = {p: pos.get("allocated_r", 1.0)
-                       for p, pos in getattr(trader, "positions", {}).items()}
+    # "STRATEJI:sembol" -> o işleme ayrılan R (bütçe iadesini sınırlamak için).
+    # Anahtar strateji adını TAŞIMALI: iki defter aynı sembolü tutabilir ve tek
+    # anahtarla biri diğerinin tahsisini ezerdi. Ezilen tahsis sessizce
+    # varsayılana (1.0R) düşer, yani risk bütçesi yanlış iade edilir.
+    _alloc_of: dict = {
+        f"TREND:{p}": pos.get("allocated_r", 1.0)
+        for p, pos in getattr(trader, "positions", {}).items()
+    }
     momentum_signals: list = []
     # Art arda kaç tur hata aldık. Sıfırlanması 'toparlandı' demektir.
     _cycle_errors     = 0
@@ -587,33 +624,47 @@ def run():
         Tek iş parçacığında, ana döngünün bekleme aralığında çalışır: yeni
         eşzamanlılık (ve `trader.positions` üzerinde yarış) getirmez.
         """
-        held = getattr(trader, "positions", {})
-        if not held or not hasattr(trader, "check_positions"):
+        # Her defteri AYRI yönet. Ortak olan yalnız fiyat: aynı sembolü iki
+        # strateji tutuyorsa fiyat bir kez çekilir, karar iki kez verilir.
+        defterler = [("TREND", trader)]
+        if PAPER_TRADING and MOMENTUM_ENABLED and not MOMENTUM_SHADOW_MODE:
+            defterler.append(("MOMENTUM_FAST", mom_book.portfolio))
+
+        semboller = {
+            sym
+            for _, pf in defterler
+            for sym in getattr(pf, "positions", {})
+        }
+        if not semboller:
             return
 
-        px = mdm.get_prices_for(list(held.keys()), max_age_seconds=MAX_PRICE_AGE_SEC)
+        px = mdm.get_prices_for(sorted(semboller), max_age_seconds=MAX_PRICE_AGE_SEC)
         # Taze fiyat yoksa karar YOK. Bayat fiyatla stop kararı vermek,
         # kararı hiç vermemekten kötüdür.
         if not px:
             return
 
-        try:
-            kapananlar = trader.check_positions(px)
-        except Exception:
-            # Bu fonksiyon hem normal turda hem HATA turunda çağrılıyor.
-            # Buradan istisna kaçarsa hata işleyicisinin kendisi patlar ve
-            # döngü yine ölür — koruma kendi koruduğu şeyi öldürmemeli.
-            logger.exception("check_positions başarısız")
-            return
+        for ad, pf in defterler:
+            if not getattr(pf, "positions", None) or not hasattr(pf, "check_positions"):
+                continue
+            try:
+                kapananlar = pf.check_positions(px)
+            except Exception:
+                # Bu fonksiyon hem normal turda hem HATA turunda çağrılıyor.
+                # Buradan istisna kaçarsa hata işleyicisinin kendisi patlar ve
+                # döngü yine ölür — koruma kendi koruduğu şeyi öldürmemeli.
+                # Bir defterin hatası DİĞER defteri de yönetimsiz bırakmamalı.
+                logger.exception(f"{ad}: check_positions başarısız")
+                continue
 
-        for sym, reason, pnl, r_mult in kapananlar:
-            logger.info(f"KAPANDI: {sym} | {reason} | PnL:{pnl:+.2f}$ ({r_mult:+.2f}R)")
-            kill_switch.record_trade_close(
-                pnl, _equity(), realized_r=r_mult, symbol=sym,
-                allocated=_alloc_of.pop(sym, 1.0),
-            )
-            tg.notify_close(sym, "", px.get(sym, 0), pnl, reason)
-            _save_state()
+            for sym, reason, pnl, r_mult in kapananlar:
+                logger.info(f"KAPANDI [{ad}]: {sym} | {reason} | PnL:{pnl:+.2f}$ ({r_mult:+.2f}R)")
+                kill_switch.record_trade_close(
+                    pnl, _equity(), realized_r=r_mult, symbol=sym,
+                    allocated=_alloc_of.pop(f"{ad}:{sym}", 1.0),
+                )
+                tg.notify_close(sym, "", px.get(sym, 0), pnl, reason)
+                _save_state()
 
     with Live(console=console, refresh_per_second=2, screen=True) as live:
         while running:
@@ -663,7 +714,7 @@ def run():
                             pnl, _equity(), realized_r=r_mult, symbol=sym, allocated=alloc,
                         )
                         tg.notify_close(sym, "", 0.0, pnl, reason)
-                        _alloc_of.pop(sym, None)
+                        _alloc_of.pop(f"TREND:{sym}", None)
                     if getattr(trader, "exchange_closed", None):
                         trader.exchange_closed.clear()
                         _save_state()
@@ -685,7 +736,7 @@ def run():
                         )
                         kill_switch.record_trade_close(
                             pnl, _equity(), realized_r=r_mult, symbol=sym,
-                            allocated=_alloc_of.pop(sym, 1.0),
+                            allocated=_alloc_of.pop(f"TREND:{sym}", 1.0),
                         )
                         tg.notify_close(sym, "", prices.get(sym, 0), pnl, reason)
                     if closed:
@@ -823,6 +874,16 @@ def run():
                         break
 
                     strategy = getattr(sig, "strategy", "TREND")
+                    # Bu adayın defteri. Pozisyon limiti, açık risk ve marj
+                    # kontrolleri KENDİ portföyüne göre yapılır; aksi hâlde
+                    # MOMENTUM, TREND'in doluluğu yüzünden işlem açamaz ve
+                    # ölçtüğümüz şey stratejinin kendisi olmaktan çıkar.
+                    pf = book_of(strategy)
+                    positions = getattr(pf, "positions", {})
+                    equity = (
+                        pf.balance + sum(x.get("margin", 0.0) for x in positions.values())
+                        if isinstance(pf, PaperPortfolio) else _equity()
+                    )
                     is_trade_signal = (
                         sig.action in ("BUY", "SELL")
                         and getattr(sig, "confidence", 0) >= (
@@ -990,7 +1051,7 @@ def run():
                     if strategy == "MOMENTUM_FAST":
                         snapshot["momentum_features"] = getattr(sig, "features", {})
 
-                    ok, msg = trader.open_position(
+                    ok, msg = pf.open_position(
                         sig.symbol, sig.action, sig.price,
                         margin, leverage, sig.sl, sig.tp,
                         reason=sig.reason, score=sig.score,
@@ -1003,10 +1064,13 @@ def run():
                     )
                     if ok:
                         kill_switch.record_trade_open(equity, risk_r=alloc_r, strategy=strategy)
-                        if sig.symbol in trader.positions:
-                            trader.positions[sig.symbol]["allocated_r"] = alloc_r
-                        _alloc_of[sig.symbol] = alloc_r
-                        positions = trader.positions
+                        if sig.symbol in pf.positions:
+                            pf.positions[sig.symbol]["allocated_r"] = alloc_r
+                        # Anahtar strateji ADIYLA: iki defter aynı sembolü
+                        # tutabilir, tek anahtar kullanılsa biri diğerinin
+                        # risk tahsisini ezerdi.
+                        _alloc_of[f"{strategy}:{sig.symbol}"] = alloc_r
+                        positions = pf.positions
                         logger.info(
                             f"AÇILDI [{strategy}]: {sig.symbol} {sig.action} "
                             f"@{sig.price:.5g} | {leverage}x | "

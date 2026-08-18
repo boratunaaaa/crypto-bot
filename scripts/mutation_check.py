@@ -425,6 +425,30 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
             float(pos.get("margin", 0.0)) for pos in self.portfolio.positions.values()
         )''',
      '        return self.portfolio.balance'),
+
+    # 2026-08-18: MOMENTUM gölgeden çıkıp kendi portföyüne bağlandı.
+    # Buradaki hatalar sessizdir: portföyler karışır, sayı yanlış çıkar.
+    ("M80", "main.py", "MOMENTUM yine TREND'in kasasından harcar",
+     '                    ok, msg = pf.open_position(',
+     '                    ok, msg = trader.open_position('),
+
+    ("M81", "main.py", "Pozisyon limiti ortak sayılır (MOMENTUM işlem açamaz)",
+     '                    positions = getattr(pf, "positions", {})',
+     '                    positions = getattr(trader, "positions", {})'),
+
+    ("M82", "main.py", "Risk tahsisi anahtarı strateji taşımaz (tahsis ezilir)",
+     '                        _alloc_of[f"{strategy}:{sig.symbol}"] = alloc_r',
+     '                        _alloc_of[sig.symbol] = alloc_r'),
+
+    ("M83", "main.py", "Bir defterin hatası diğerini de yönetimsiz bırakır",
+     '''                logger.exception(f"{ad}: check_positions başarısız")
+                continue''',
+     '''                logger.exception(f"{ad}: check_positions başarısız")
+                return'''),
+
+    ("M84", "config.py", "MOMENTUM sermayesi TREND'den farklı (kıyas bozulur)",
+     'MOMENTUM_BALANCE       = 1000.0',
+     'MOMENTUM_BALANCE       = 250.0'),
 ]
 
 
