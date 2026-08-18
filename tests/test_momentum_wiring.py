@@ -183,3 +183,53 @@ def test_golge_kaydi_artik_yapilmiyor():
     """Gölge modda kalsaydı işlem hiç açılmaz, deney başlamazdı."""
     assert "if MOMENTUM_SHADOW_MODE:" in _MAIN   # kod yolu duruyor (geri dönüş mümkün)
     assert config.MOMENTUM_SHADOW_MODE is False  # ama kapalı
+
+
+# ── Çoklu strateji deneyi ─────────────────────────────────────────────────────
+# BREAKOUT / PULLBACK / MEANREV kendi portföyleriyle bağlandı. Buradaki risk
+# yine SIZINTI: bir strateji yanlış deftere açarsa hata vermez, sadece yanlış
+# sayı üretir ve deney sessizce geçersizleşir.
+
+def test_deney_stratejileri_kendi_defterlerine_yonlendiriliyor():
+    assert "if strategy in lab_books:" in _MAIN
+    assert "return lab_books[strategy].portfolio" in _MAIN
+
+
+def test_deney_defterleri_pozisyon_izlemeye_dahil():
+    """Dahil olmasalardı stopları HİÇ kontrol edilmezdi."""
+    assert "defterler.extend((ad, k.portfolio) for ad, k in lab_books.items())" in _MAIN
+
+
+def test_deney_defterleri_kaydediliyor():
+    """Kaydedilmezse restart'ta sermaye ve pozisyonlar sıfırlanır."""
+    assert "for _k in lab_books.values():" in _MAIN
+    assert "_k.save()" in _MAIN
+
+
+def test_hepsi_ayni_sermayeyle_baslar():
+    """Kıyas ancak eşit koşulda anlamlı: farklı sermaye, farklı dolar sonucu
+    üretir ve 'daha çok kazandı' yanıltıcı olur."""
+    assert config.EXPERIMENT_BALANCE == config.MOMENTUM_BALANCE == config.PAPER_BALANCE
+
+
+def test_deney_stratejileri_KAGIT_modla_sinirli():
+    """Gerçek para yolu bu deneye maruz bırakılmamalı."""
+    bolum = _govde("    lab_books: dict = {}")
+    assert "PAPER_TRADING" in _MAIN[_MAIN.index("lab_books: dict = {}"):][:400]
+
+
+def test_deney_taramasinin_hatasi_TREND_i_durdurmaz():
+    """Deney taraması patlarsa ana bot çalışmaya devam etmeli."""
+    yer = _MAIN.index("lab_signals = strategies_mod.scan(")
+    bolum = _MAIN[yer - 400:yer + 1600]
+    assert "except Exception as exc:" in bolum
+    assert "Deney taraması hatası" in bolum
+
+
+def test_deney_stratejileri_kendi_esigini_kullanir():
+    assert "EXPERIMENT_MIN_SCORE / 100 if strategy in lab_books" in _MAIN
+
+
+def test_kayitli_strateji_sayisi_ve_adlari():
+    import strategies as st
+    assert set(st.REGISTRY) == {"BREAKOUT", "PULLBACK", "MEANREV"}

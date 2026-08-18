@@ -21,6 +21,7 @@ from config import (
     PAPER_TRADING, SIGNAL_INTERVAL, POSITION_CHECK_INTERVAL,
     MAX_CORRELATED_POSITIONS, MIN_CONFIDENCE, MIN_MARGIN_USDT, PAPER_BALANCE,
     MOMENTUM_ENABLED, MOMENTUM_SHADOW_MODE, MOMENTUM_MIN_SCORE, MOMENTUM_BALANCE,
+    EXPERIMENT_STRATEGIES_ENABLED, EXPERIMENT_BALANCE, EXPERIMENT_MIN_SCORE,
     HEARTBEAT_ENABLED, HEARTBEAT_INTERVAL_MIN, STALE_ALERT_MINUTES,
     DAILY_RISK_BUDGET_R, MAX_SPREAD_PCT, MAX_PRICE_AGE_SEC,
     CORRELATION_GUARD_ENABLED, MAX_NET_DIRECTIONAL_R,
@@ -51,6 +52,7 @@ from database import (
 )
 from telegram_bot import TelegramBot
 import momentum as momentum_mod
+import strategies as strategies_mod
 import correlation as corr
 
 logging.basicConfig(
@@ -151,6 +153,22 @@ def run():
             f"{len(mom_book.portfolio.positions)} açık pozisyon"
         )
 
+    # ── Deney stratejileri: her biri KENDİ sanal sermayesiyle ───────────────
+    # Hepsi TREND ile AYNI başlangıç sermayesi alır: karşılaştırma ancak eşit
+    # koşulda anlamlıdır. Ortak olan piyasa verisi, çıkış motoru ve emir
+    # simülasyonu; ayrı olan sermaye, pozisyon, PnL ve state.
+    lab_books: dict = {}
+    if PAPER_TRADING and EXPERIMENT_STRATEGIES_ENABLED:
+        for _ad in strategies_mod.REGISTRY:
+            _kitap = StrategyBook(_ad, PaperPortfolio(EXPERIMENT_BALANCE))
+            _vardi = _kitap.restore()
+            lab_books[_ad] = _kitap
+            logger.info(
+                f"{_ad} portföyü {'geri yüklendi' if _vardi else 'ilk kez kuruldu'}: "
+                f"{_kitap.portfolio.balance:.2f}$, "
+                f"{len(_kitap.portfolio.positions)} açık pozisyon"
+            )
+
     def book_of(strategy: str):
         """Stratejinin portföyü. Bilinmeyen strateji TREND'e düşer.
 
@@ -160,6 +178,8 @@ def run():
         if (strategy == "MOMENTUM_FAST" and PAPER_TRADING
                 and MOMENTUM_ENABLED and not MOMENTUM_SHADOW_MODE):
             return mom_book.portfolio
+        if strategy in lab_books:
+            return lab_books[strategy].portfolio
         return trader
 
     ks_saved = state_get("kill_switch")
@@ -205,6 +225,13 @@ def run():
             # MOMENTUM ayrı defter: kendi satırlarına yazar, TREND'inkine dokunmaz.
             if mom_book.portfolio.positions or mom_book.portfolio.total_pnl:
                 mom_book.save()
+            for _k in lab_books.values():
+                # Her defter AYRI kaydedilir; birinin hatası diğerlerini
+                # engellemesin diye tek tek sarmalanıyor.
+                try:
+                    _k.save()
+                except Exception:
+                    logger.exception(f"{_k.name}: portföy kaydedilemedi")
         except Exception as e:
             logger.error(f"State kaydedilemedi: {e}")
 
@@ -629,6 +656,7 @@ def run():
         defterler = [("TREND", trader)]
         if PAPER_TRADING and MOMENTUM_ENABLED and not MOMENTUM_SHADOW_MODE:
             defterler.append(("MOMENTUM_FAST", mom_book.portfolio))
+        defterler.extend((ad, k.portfolio) for ad, k in lab_books.items())
 
         semboller = {
             sym
@@ -867,6 +895,32 @@ def run():
                         s for s in momentum_signals
                         if s.action in ("BUY", "SELL") and s.score >= MOMENTUM_MIN_SCORE
                     ])
+                # ── Deney stratejileri ─────────────────────────────────
+                # Ayrı tarama: kendi sinyallerini üretirler, kendi
+                # portföylerine açarlar. Hata olursa DİĞER stratejiler ve
+                # TREND etkilenmez — deneyin veri akışı kesilmemeli.
+                if lab_books:
+                    try:
+                        lab_signals = strategies_mod.scan(
+                            ready[:60],
+                            lambda sym: mdm.get_ohlcv(sym),
+                            lambda sym: mdm.get_price(sym),
+                            btc_trend=btc_trend,
+                        )
+                        for ls in lab_signals:
+                            if ls.action == "HOLD":
+                                if ls.reject_reason:
+                                    save_missed_signal(
+                                        ls.symbol, ls.action, ls.score, ls.confidence,
+                                        f"[{ls.strategy}] {ls.reject_reason}",
+                                        btc_trend, ls.market_regime,
+                                    )
+                                continue
+                            if ls.score >= EXPERIMENT_MIN_SCORE:
+                                candidates.append(ls)
+                    except Exception as exc:
+                        logger.warning(f"Deney taraması hatası: {exc}")
+
                 candidates.extend(signals)
 
                 for sig in candidates:
@@ -887,7 +941,9 @@ def run():
                     is_trade_signal = (
                         sig.action in ("BUY", "SELL")
                         and getattr(sig, "confidence", 0) >= (
-                            MIN_CONFIDENCE if strategy == "TREND" else MOMENTUM_MIN_SCORE / 100
+                            MIN_CONFIDENCE if strategy == "TREND"
+                            else (EXPERIMENT_MIN_SCORE / 100 if strategy in lab_books
+                                  else MOMENTUM_MIN_SCORE / 100)
                         )
                     )
                     if not is_trade_signal:

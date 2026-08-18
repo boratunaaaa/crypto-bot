@@ -453,6 +453,36 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     ("M85", "momentum.py", "Sinyal strateji adini tasimaz (sessizce TREND kasasindan harcar)",
      'STRATEGY_NAME = "MOMENTUM_FAST"',
      'STRATEGY_NAME = "TREND"'),
+
+    # 2026-08-18: BREAKOUT / PULLBACK / MEANREV deney stratejileri.
+    ("M86", "strategies.py", "MEANREV trend icinde de calisir (klasik olum bicimi)",
+     '''    trend_gucu = abs(ema_m - ema_s) / max(atr, 1e-12)
+    if trend_gucu > 1.0:''',
+     '''    trend_gucu = abs(ema_m - ema_s) / max(atr, 1e-12)
+    if False:'''),
+
+    ("M87", "strategies.py", "BREAKOUT kanala SON bari da katar (her bar kirilim gorunur)",
+     '    onceki = df.iloc[:-1]',
+     '    onceki = df'),
+
+    ("M88", "strategies.py", "BREAKOUT hacim teyidi aranmaz (gurultuyu kirilim sanar)",
+     '    if hacim_x < VOLUME_CONFIRM_X:',
+     '    if False:'),
+
+    ("M89", "strategies.py", "Bir stratejinin hatasi digerlerinin akisini keser",
+     '''            except Exception as exc:  # noqa: BLE001 — bir strateji diğerini durduramaz
+                out.append(_red(sym, price, ad, f"hata: {type(exc).__name__}"))''',
+     '''            except Exception as exc:
+                raise'''),
+
+    ("M90", "main.py", "Deney defterleri pozisyon izlemeye dahil edilmez (stoplar kontrolsuz)",
+     '        defterler.extend((ad, k.portfolio) for ad, k in lab_books.items())',
+     '        pass'),
+
+    ("M91", "main.py", "Deney stratejileri yine TREND defterine acar",
+     '''        if strategy in lab_books:
+            return lab_books[strategy].portfolio''',
+     '        pass'),
 ]
 
 

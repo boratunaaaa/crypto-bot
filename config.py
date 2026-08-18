@@ -242,6 +242,20 @@ MOMENTUM_SHADOW_MODE   = False  # False → KENDİ portföyüyle işlem açar (2
 #
 # TREND ile AYNI başlangıç sermayesi: karşılaştırma ancak eşit koşulda anlamlı.
 MOMENTUM_BALANCE       = 1000.0
+
+# ── Çoklu strateji deneyi (2026-08-18) ────────────────────────────────────────
+# BREAKOUT / PULLBACK / MEANREV: her biri KENDİ sanal sermayesiyle, kâğıt modda.
+# Amaç "en çok kazananı bulup gerçek paraya geçmek" DEĞİL; hangi fikrin
+# tekrarlanabilir avantajı olduğunu ölçmek. Terfi kararını `strategy_lab.py`
+# veriyor ve sistem kendi kendine gerçek paraya GEÇEMİYOR.
+EXPERIMENT_STRATEGIES_ENABLED = True
+# TREND ve MOMENTUM ile AYNI sermaye — kıyas ancak eşit koşulda anlamlı.
+EXPERIMENT_BALANCE            = 1000.0
+# Giriş eşiği. Stratejilerin kendi skorları 58-100 bandında üretiliyor;
+# 70 eşiği "zayıf sinyali alma" demek. Bu sayı geçmiş veriye BAKILARAK
+# seçilmedi — MOMENTUM_MIN_SCORE ile aynı tutuldu ki stratejiler arasındaki
+# fark eşik farkından değil FİKİR farkından gelsin.
+EXPERIMENT_MIN_SCORE          = 70
 MOMENTUM_RISK_SHARE    = 0.30   # günlük risk bütçesinin en fazla %30'unu kullanır
 MOMENTUM_MIN_SCORE     = 70
 
