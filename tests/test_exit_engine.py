@@ -17,6 +17,7 @@ from position import (
     EXIT_INITIAL_STOP, EXIT_BREAKEVEN_STOP, EXIT_TRAIL_STOP,
     EXIT_TIME_STOP, EXIT_TP1, EXIT_TP2,
     STOP_KIND_INITIAL, STOP_KIND_BREAKEVEN, STOP_KIND_TRAIL,
+    _breakeven_price, _tighten_stop,
 )
 
 
@@ -175,12 +176,76 @@ def test_short_runner_trails_down():
 # ── Breakeven stop'a dönüş ────────────────────────────────────────────────────
 
 def test_breakeven_stop_exit_is_labelled_separately():
-    """TP1 alındıktan sonra geri dönen pozisyon 'zarar' olarak etiketlenmemeli."""
+    """TP1 alındıktan sonra geri dönen pozisyon 'zarar' olarak etiketlenmemeli.
+
+    2026-08-18: bu test eskiden etiketin tam olarak BREAKEVEN_STOP olmasını
+    şart koşuyordu. TP1'den sonra trailing devreye girince stop başabaşın
+    ÜSTÜNE çıkıyor (100.15 -> 100.60) ve çıkış doğru biçimde TRAIL_STOP
+    etiketleniyor. Testin niyeti — "zarar diye etiketleme" — korunuyor;
+    değişen, eski davranışı sabitleyen satırdı.
+    """
     pos = make_pos(entry=100.0, stop=98.0)
     acts = drive(pos, [100.0, 102.0, 101.0, 100.05])
     closes = [a for a in acts if a["type"] == "CLOSE"]
     assert len(closes) == 1
-    assert closes[0]["reason"] == EXIT_BREAKEVEN_STOP
+    assert closes[0]["reason"] in (EXIT_BREAKEVEN_STOP, EXIT_TRAIL_STOP)
+    assert closes[0]["reason"] != EXIT_INITIAL_STOP, "zarar olarak etiketlendi"
+
+
+def test_tp1_sonrasi_stop_basabasta_DONMAZ_takip_eder():
+    """+1R ile +2R arasındaki "ölü bölge" — kârın sızdığı yer.
+
+    Trailing yalnız TP2'de (+2R) açılıyordu; TP1 sonrası stop başabaşta
+    donuyordu. Ölçüm (12-18 Ağustos): bu bölgede kapanan 8 işlemin hepsi
+    1.25-1.93R lehte hareket gördü ama alınan 0.20-0.44R oldu (biri -0.05R).
+    Yani bot +1.9R'lik kazançları düzenli olarak +0.3R'ye çeviriyordu.
+
+    Korumanın GEVŞEMEDİĞİ de burada sabitleniyor: yeni stop başabaşın altına
+    inemez (`_tighten_stop` yalnız lehte yönde taşır).
+    """
+    pos = make_pos(entry=100.0, stop=98.0)
+    drive(pos, [100.0, 102.0, 103.0])          # TP1 geçildi, fiyat lehte koştu
+    basabas = _breakeven_price(pos)
+    assert pos["trailing_active"], "TP1 sonrası trailing açılmadı — ölü bölge sürüyor"
+    assert pos["stop_loss"] > basabas, (
+        f"stop başabaşta ({basabas:.4f}) dondu, takip etmedi ({pos['stop_loss']:.4f})"
+    )
+    assert pos["stop_kind"] == STOP_KIND_TRAIL
+
+
+def test_takip_korumayi_asla_gevsetmez():
+    """`_tighten_stop` sözleşmesi: stop YALNIZ lehte yönde taşınır.
+
+    Bu, TP1 sonrası trailing'i açmanın güvenli olmasının TEK dayanağı — yeni
+    stop başabaşın gerisindeyse reddedilmeli. Senaryo üzerinden dolaylı test
+    etmek yetmiyordu: chandelier stop zirveye bağlı, zirve de hiç düşmediği
+    için stop kendiliğinden geri gitmiyordu ve garanti bozulsa bile test
+    yeşil kalıyordu. Garanti burada doğrudan sınanıyor.
+    """
+    # LONG: daha düşük stop reddedilmeli
+    pos = make_pos(entry=100.0, stop=98.0)
+    _tighten_stop(pos, 99.0, STOP_KIND_TRAIL)
+    assert pos["stop_loss"] == 99.0, "lehte taşıma kabul edilmeliydi"
+    _tighten_stop(pos, 98.5, STOP_KIND_TRAIL)
+    assert pos["stop_loss"] == 99.0, "stop geriye taşındı — koruma gevşedi"
+
+    # SHORT: daha yüksek stop reddedilmeli
+    poss = make_pos(entry=100.0, stop=102.0, side="SELL")
+    _tighten_stop(poss, 101.0, STOP_KIND_TRAIL)
+    assert poss["stop_loss"] == 101.0
+    _tighten_stop(poss, 101.5, STOP_KIND_TRAIL)
+    assert poss["stop_loss"] == 101.0, "SHORT tarafında koruma gevşedi"
+
+
+def test_tp1_sonrasi_takip_gerideki_stopu_kabul_etmez():
+    """Bütünsel kontrol: TP1'den sonra stop hiçbir turda geri gitmez."""
+    pos = make_pos(entry=100.0, stop=98.0)
+    drive(pos, [100.0, 102.0, 103.0])
+    izlenen = [pos["stop_loss"]]
+    for px in (102.5, 102.0, 101.5, 102.8, 101.0):
+        drive(pos, [px])
+        izlenen.append(pos["stop_loss"])
+    assert izlenen == sorted(izlenen), f"stop geriye gitti: {izlenen}"
 
 
 # ── Time stop ─────────────────────────────────────────────────────────────────

@@ -631,10 +631,26 @@ def get_week_realized_pnl(now: datetime | None = None) -> float | None:
             # BOZUK sayaca geri düşmesine yol açardı — yani düzeltmenin kendisi
             # düzeltmek istediği kilidi yeniden kurardı.
             cols = {r[1] for r in con.execute("PRAGMA table_info(trades)")}
+            # Bakiye sıfırlandıysa ölçüm o andan İTİBAREN sayılır.
+            #
+            # 2026-08-18: bakiye 1000$'a sıfırlanırken fark edildi — sıfırlama
+            # tek başına sessiz bir kilit üretiyordu. Haftalık zarar limiti %10
+            # ve ölçülen haftalık PnL -103.90$'dı; yeni hafta başı bakiyesi
+            # 1000$ olunca eşik -100$ oluyor ve bot AÇILIR AÇILMAZ kendini
+            # durduruyordu. Yani "temiz başlangıç" isteği, botun hiç işlem
+            # açmadığı bir başlangıca dönüşecekti.
+            #
+            # Çözüm işlem geçmişini SİLMEK değil (veri veridir), ölçümün
+            # başlangıç noktasını kaydetmek. Sıfırlama anından önceki işlemler
+            # yeni dönemin risk bütçesine yazılmaz.
+            baslangic = state_get("balance_reset_at")
+            alt_sinir = monday.isoformat()
+            if baslangic and str(baslangic) > alt_sinir:
+                alt_sinir = str(baslangic)
             sql = ("SELECT COALESCE(SUM(net_pnl), 0.0) AS s FROM trades "
                    "WHERE close_time IS NOT NULL "
                    "AND close_time >= ? AND close_time < ?")
-            params: list = [monday.isoformat(), next_monday.isoformat()]
+            params: list = [alt_sinir, next_monday.isoformat()]
             if "mode" in cols:
                 sql += " AND COALESCE(mode, 'paper') = ?"
                 params.append(_mode())

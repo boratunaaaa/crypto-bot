@@ -18,7 +18,7 @@ from rich.console import Console
 _BOT_DIR = Path(__file__).parent
 
 from config import (
-    PAPER_TRADING, SIGNAL_INTERVAL,
+    PAPER_TRADING, SIGNAL_INTERVAL, POSITION_CHECK_INTERVAL,
     MAX_CORRELATED_POSITIONS, MIN_CONFIDENCE, MIN_MARGIN_USDT, PAPER_BALANCE,
     MOMENTUM_ENABLED, MOMENTUM_SHADOW_MODE, MOMENTUM_MIN_SCORE,
     HEARTBEAT_ENABLED, HEARTBEAT_INTERVAL_MIN, STALE_ALERT_MINUTES,
@@ -63,6 +63,26 @@ running = True
 
 # Watchdog: ana döngünün son tur zamanı. Heartbeat thread'i bunu izler.
 _last_loop_ts = time.time()
+
+
+def drop_stale_prices(held: list, fresh: dict, prices: dict) -> list:
+    """Taze fiyatı olmayan sembolleri `prices`'tan DÜŞÜR (yerinde değiştirir).
+
+    Bayat fiyatla stop kararı vermek, kararı hiç vermemekten kötüdür: fiyat
+    stop'u çoktan geçmişken bot "henüz geçmedi" sanır ve pozisyonu taşır.
+
+    Bu kural ana döngünün içinde satır satır duruyordu ve bu yüzden hiçbir test
+    ona dokunamıyordu — mutasyon denetimi kuralı bozduğunda tüm testler yeşil
+    kalıyordu. Kural artık burada, çağrılabilir ve ölçülebilir hâlde.
+
+    Dönen liste: düşürülen semboller (çağıran loglayabilsin diye).
+    """
+    dropped = []
+    for sym in list(held):
+        if sym not in fresh:
+            prices.pop(sym, None)
+            dropped.append(sym)
+    return dropped
 
 
 def handle_exit(sig, frame):
@@ -548,6 +568,42 @@ def run():
                        for p, pos in getattr(trader, "positions", {}).items()}
     momentum_signals: list = []
 
+    def _watch_positions() -> None:
+        """Açık pozisyonların stop/çıkış kontrolü — sinyal taramasından BAĞIMSIZ.
+
+        Neden ayrı: stop kontrolü ana döngüye bağlıydı ve ana döngü
+        `SIGNAL_INTERVAL` (30 sn) uyuyordu. Yani fiyat stop'u geçse bile bot
+        bunu ortalama 15, en kötü 30 saniye sonra fark ediyordu; üstüne fiyat
+        tazeliği 90 saniyeye kadar gevşekti. Ölçülen sonuç: `INITIAL_STOP` ile
+        kapanan 32 işlemin 32'si de planlanan -1R'yi aştı (fazla zarar 119.50$).
+
+        Sinyal taraması ağırdır (yüzlerce sembol, gösterge hesabı); onu
+        hızlandırmak pahalı ve gereksiz. Pozisyon kontrolü ise yalnız açık
+        sembollerin fiyatına bakar — ucuzdur. Bu yüzden pahalı tarama 30
+        saniyede kalır, ucuz koruma sık çalışır.
+
+        Tek iş parçacığında, ana döngünün bekleme aralığında çalışır: yeni
+        eşzamanlılık (ve `trader.positions` üzerinde yarış) getirmez.
+        """
+        held = getattr(trader, "positions", {})
+        if not held or not hasattr(trader, "check_positions"):
+            return
+
+        px = mdm.get_prices_for(list(held.keys()), max_age_seconds=MAX_PRICE_AGE_SEC)
+        # Taze fiyat yoksa karar YOK. Bayat fiyatla stop kararı vermek,
+        # kararı hiç vermemekten kötüdür.
+        if not px:
+            return
+
+        for sym, reason, pnl, r_mult in trader.check_positions(px):
+            logger.info(f"KAPANDI: {sym} | {reason} | PnL:{pnl:+.2f}$ ({r_mult:+.2f}R)")
+            kill_switch.record_trade_close(
+                pnl, _equity(), realized_r=r_mult, symbol=sym,
+                allocated=_alloc_of.pop(sym, 1.0),
+            )
+            tg.notify_close(sym, "", px.get(sym, 0), pnl, reason)
+            _save_state()
+
     with Live(console=console, refresh_per_second=2, screen=True) as live:
         while running:
             t0 = time.perf_counter()
@@ -559,19 +615,28 @@ def run():
             # asla stop kontrolü yapma — 2026-08-07 WS olayı)
             held_positions = getattr(trader, "positions", {})
             if held_positions:
-                fresh = mdm.get_prices_for(list(held_positions.keys()))
+                fresh = mdm.get_prices_for(
+                    list(held_positions.keys()), max_age_seconds=MAX_PRICE_AGE_SEC
+                )
                 prices.update(fresh)
                 # DENETİM BULGUSU: REST yenilemesi BAŞARISIZ olursa sözlükteki
                 # eski WebSocket fiyatı yerinde kalıyor ve stop motoru onu
                 # kullanmaya devam ediyordu. Bayat fiyatla stop kararı vermek,
                 # kararı hiç vermemekten kötüdür.
-                for _sym in list(held_positions):
-                    if _sym not in fresh and mdm.price_age(_sym) > MAX_PRICE_AGE_SEC * 3:
-                        prices.pop(_sym, None)
-                        logger.warning(
-                            f"{_sym}: fiyat bayat ({mdm.price_age(_sym):.0f}s) — "
-                            f"bu turda çıkış değerlendirilmiyor"
-                        )
+                #
+                # 2026-08-18: bu koruma yazıldığı günden beri HİÇ çalışmamıştı.
+                # `get_prices_for` varsayılan 90 saniyelik eşikle çağrılıyordu,
+                # yani 89 saniyelik fiyat `fresh` içinde dönüyordu; koruma ise
+                # yalnız `fresh` DIŞINDA kalanlara bakıyordu. Korumanın kendi
+                # eşiği (60s) getirme eşiğinden (90s) sıkı olduğu için elemek
+                # istediği fiyatlar ona hiç ulaşmadı. Artık eşik tek: `fresh`
+                # değilse karar verilmez — "taze değil" ile "kullanılabilir"
+                # arasında boşluk bırakmıyoruz.
+                for _sym in drop_stale_prices(list(held_positions), fresh, prices):
+                    logger.warning(
+                        f"{_sym}: fiyat bayat ({mdm.price_age(_sym):.0f}s) — "
+                        f"bu turda çıkış değerlendirilmiyor"
+                    )
             if hasattr(trader, "mark"):
                 trader.mark(prices)
 
@@ -998,8 +1063,17 @@ def run():
 
             elapsed   = time.perf_counter() - t0
             sleep_for = max(0.0, SIGNAL_INTERVAL - elapsed)
-            if sleep_for > 0 and running:
-                time.sleep(sleep_for)
+            # Beklerken uyumak yerine pozisyonları izle: bekleme süresi
+            # POSITION_CHECK_INTERVAL'lık dilimlere bölünür ve her dilimde
+            # yalnız açık pozisyonların stopları kontrol edilir. Sinyal
+            # taraması yine SIGNAL_INTERVAL'da bir çalışır.
+            _slept = 0.0
+            while running and _slept < sleep_for:
+                _slice = min(POSITION_CHECK_INTERVAL, sleep_for - _slept)
+                time.sleep(_slice)
+                _slept += _slice
+                if running:
+                    _watch_positions()
 
     _save_state()
     mdm.stop()

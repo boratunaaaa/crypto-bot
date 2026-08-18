@@ -48,6 +48,12 @@ COIN_REFRESH_SEC         = 3600
 OHLCV_REFRESH_SEC        = 60
 OHLCV_REFRESH_SEC_CTX    = 900
 SIGNAL_INTERVAL          = 30
+# Açık pozisyonların stop kontrolü bu sıklıkta çalışır — sinyal taramasından
+# BAĞIMSIZ. Eskiden stop kontrolü SIGNAL_INTERVAL'a bağlıydı: fiyat stop'u
+# geçtiğinde bot bunu en kötü 30 saniye sonra fark ediyordu. Tarama pahalıdır
+# (yüzlerce sembol), pozisyon kontrolü ucuzdur (yalnız açık semboller) — bu
+# yüzden ikisi ayrı hızda çalışır.
+POSITION_CHECK_INTERVAL  = 3
 
 # Likidite / execution kalitesi filtreleri
 MIN_QUOTE_VOLUME_24H     = 3_000_000.0   # 24s hacim (USDT) — altı taranmaz

@@ -702,7 +702,9 @@ class MarketDataManager:
         with self._lock:
             return dict(self._prices)
 
-    def get_prices_for(self, symbols: list[str], max_age_seconds: float = 90) -> dict[str, float]:
+    def get_prices_for(
+        self, symbols: list[str], max_age_seconds: float = MAX_PRICE_AGE_SEC
+    ) -> dict[str, float]:
         """Fiyatlar, açık pozisyon SL/TP kontrolü gibi güvenlik-kritik kullanım
         için: ``symbols`` içindeki her sembol için WS mini-ticker'dan gelen
         fiyat ``max_age_seconds``'tan taze değilse (veya hiç yoksa), REST
@@ -715,7 +717,16 @@ class MarketDataManager:
         kapanmadı, bot 4 hayalet pozisyonla "dolu" kalıp yeni işlem açmayı
         durdurdu. Kök neden kesin olarak WS kütüphanesinin belirli sembolleri
         sessizce düşürmesiyle açıklanabiliyor; bu yöntem nedeni ne olursa
-        olsun aynı sonucu (sessiz, kalıcı fiyat donması) engeller."""
+        olsun aynı sonucu (sessiz, kalıcı fiyat donması) engeller.
+
+        2026-08-18: varsayılan eşik 90 saniyeydi ve stop kontrolü tam da bu
+        varsayılanı kullanıyordu — yani 89 saniyelik bir fiyat "taze" sayılıp
+        stop kararına giriyordu. Ölçüm: `INITIAL_STOP` ile kapanan **32
+        işlemin 32'si de** planlanan -1R'yi aştı; plan dışı fazla zarar
+        119.50$. Giriş yolu ise zaten sıkı olan `MAX_PRICE_AGE_SEC`'i (20s)
+        açıkça geçiriyordu: güvenlik-kritik olan taraf gevşek, olmayan taraf
+        sıkıydı. Varsayılan artık aynı sabit; gevşetmek isteyen çağıranın
+        bunu BİLEREK yazması gerekir."""
         now = time.time()
         with self._lock:
             fresh = {

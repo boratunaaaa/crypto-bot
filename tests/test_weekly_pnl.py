@@ -82,3 +82,42 @@ def test_empty_week_is_zero_not_none():
     """Boş hafta 0 döner; None 'ölçemedim' demektir ve sayaca düşülür."""
     v = get_week_realized_pnl()
     assert v == pytest.approx(0.0) and v is not None
+
+
+# ── Bakiye sıfırlaması ────────────────────────────────────────────────────────
+# 2026-08-18: bakiyeyi 1000$'a sıfırlamak TEK BAŞINA sessiz bir kilit üretiyordu.
+# Haftalık zarar limiti %10; o hafta ölçülen PnL -103.90$'dı. Yeni hafta başı
+# bakiyesi 1000$ olunca eşik -100$ oluyor ve bot AÇILIR AÇILMAZ kendini
+# durduruyordu — yani "temiz başlangıç", hiç işlem açmayan bir başlangıç olurdu.
+# Çözüm geçmişi silmek değil (veri veridir), ölçümün başlangıcını kaydetmek.
+
+def test_sifirlamadan_onceki_islemler_yeni_doneme_yazilmaz():
+    from database import state_set_many
+
+    now = datetime.now()
+    monday = _this_monday(now)
+    sifirlama = monday + timedelta(hours=3)
+
+    _closed(-103.90, monday + timedelta(hours=1), "ONCEKI")   # sıfırlamadan ÖNCE
+    _closed(+7.50,   monday + timedelta(hours=5), "SONRAKI")  # sıfırlamadan SONRA
+
+    assert get_week_realized_pnl() == pytest.approx(-96.40, abs=0.01), (
+        "işaret yokken haftanın tamamı sayılmalı"
+    )
+
+    state_set_many({"balance_reset_at": sifirlama.isoformat()})
+    assert get_week_realized_pnl() == pytest.approx(7.50, abs=0.01), (
+        "sıfırlamadan önceki zarar yeni dönemin risk bütçesine yazıldı — "
+        "bot temiz başlangıçta kendini durdurur"
+    )
+
+
+def test_sifirlama_isareti_hafta_basindan_eskiyse_yok_sayilir():
+    """Geçen haftaki bir sıfırlama, bu haftanın ölçümünü genişletmemeli."""
+    from database import state_set_many
+
+    now = datetime.now()
+    monday = _this_monday(now)
+    state_set_many({"balance_reset_at": (monday - timedelta(days=3)).isoformat()})
+    _closed(-12.0, monday + timedelta(hours=2), "BUHAFTA")
+    assert get_week_realized_pnl() == pytest.approx(-12.0, abs=0.01)

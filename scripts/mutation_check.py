@@ -319,6 +319,51 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     ("M61", "database.py", "Haftalık PnL penceresi hafta yerine tüm geçmişi sayar",
      'AND close_time >= ? AND close_time < ?")',
      'AND close_time >= ? AND close_time < ? OR 1=1")'),
+
+    # 2026-08-18: stop kararının dayandığı fiyatın YAŞI. Ölçüm: INITIAL_STOP ile
+    # kapanan 32 işlemin 32'si de planlanan -1R'yi aştı, fazla zarar 119.50$.
+    ("M62", "market_data.py", "Stop kontrolü yine 90 saniyelik bayat fiyatı kabul eder",
+     'self, symbols: list[str], max_age_seconds: float = MAX_PRICE_AGE_SEC',
+     'self, symbols: list[str], max_age_seconds: float = 90'),
+
+    ("M63", "market_data.py", "REST veremeyince bayat fiyat yine sonuca sızar",
+     '''            price = self._fetch_price_rest(sym)
+            if price is None:
+                continue''',
+     '''            price = self._fetch_price_rest(sym)
+            if price is None:
+                fresh[sym] = self._prices.get(sym, 0.0)
+                continue'''),
+
+    ("M64", "config.py", "Stop kontrolü yine sinyal taramasının hızına bağlanır",
+     'POSITION_CHECK_INTERVAL  = 3',
+     'POSITION_CHECK_INTERVAL  = 30'),
+
+    ("M65", "main.py", "Bayat fiyatlı sembol yine stop motoruna geçer",
+     'if sym not in fresh:',
+     'if False:'),
+
+    # 2026-08-18: kâr tarafı. TP1 (+1R) ile TP2 (+2R) arası "ölü bölge"ydi;
+    # stop başabaşta donuyor, +1.9R'lik hareketler +0.3R'ye dönüyordu.
+    ("M66", "position.py", "TP1 sonrası trailing yine açılmaz (ölü bölge geri gelir)",
+     '''        if TRAIL_AFTER_TP:
+            pos["trailing_active"] = True
+    elif reason == EXIT_TP2:''',
+     '''        if False:
+            pos["trailing_active"] = True
+    elif reason == EXIT_TP2:'''),
+
+    ("M67", "position.py", "Trailing stop'u geriye de taşıyabilir (koruma gevşer)",
+     '''    if pos["side"] == "BUY":
+        if new_stop > pos["stop_loss"]:''',
+     '''    if pos["side"] == "BUY":
+        if True:'''),
+
+    # 2026-08-18: bakiye sıfırlaması, sıfırlamadan ÖNCEKİ zararı yeni dönemin
+    # haftalık risk bütçesine yazarsa bot temiz başlangıçta kendini durdurur.
+    ("M68", "database.py", "Sıfırlama öncesi zarar yine yeni döneme yazılır",
+     'if baslangic and str(baslangic) > alt_sinir:',
+     'if False:'),
 ]
 
 

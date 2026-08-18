@@ -30,7 +30,7 @@ from config import (
     COMMISSION_RATE,
     PARTIAL_EXITS_ENABLED, PARTIAL_TP1_R, PARTIAL_TP1_PCT,
     PARTIAL_TP2_R, PARTIAL_TP2_PCT,
-    BREAKEVEN_AFTER_TP1, BREAKEVEN_BUFFER_PCT,
+    BREAKEVEN_AFTER_TP1, BREAKEVEN_BUFFER_PCT, TRAIL_AFTER_TP,
     CHANDELIER_ATR_MULT_STRONG, CHANDELIER_ATR_MULT_WEAK,
     CHANDELIER_MIN_LOCK_R, TRAIL_MOMENTUM_LOOKBACK, TRAIL_MOMENTUM_SECONDS,
     TIME_STOP_ENABLED, TIME_STOP_MINUTES, TIME_STOP_MIN_MFE_R, TIME_STOP_MAX_MINUTES,
@@ -142,6 +142,23 @@ def confirm_partial(pos: dict, reason: str) -> None:
         pos["tp1_done"] = True
         if BREAKEVEN_AFTER_TP1:
             _tighten_stop(pos, _breakeven_price(pos), STOP_KIND_BREAKEVEN)
+        # TP1'den sonra da TAKİP ET — 2026-08-18 ölçümü.
+        #
+        # Trailing yalnız TP2'de (+2R) açılıyordu. Sonuç: +1R ile +2R arası bir
+        # "ölü bölge"ydi — stop başabaşta donuyor, fiyat 1.9R'ye gidip geri
+        # dönünce pozisyon ~0.3R'de kapanıyordu. Ölçüm: bu bölgede kapanan 8
+        # işlemin hepsi 1.25-1.93R lehte hareket gördü, alınan 0.20-0.44R
+        # (biri -0.05R). Aynı dönemde TP2'yi görüp trailing'e geçen 7 işlem
+        # MFE'sinin ~yarısını aldı (1.20-2.08R).
+        #
+        # Bu bir parametre tercihi değil, tutarsızlık: `TRAIL_AFTER_TP` zaten
+        # True ve kısmi çıkışlar KAPALIYKEN kod +1R'de trailing'e geçiyordu.
+        # Yalnız kısmi çıkışlar açıkken TP1 bu haktan mahrumdu.
+        #
+        # Korumayı GEVŞETMESİ imkânsız: `_tighten_stop` stop'u yalnız lehte
+        # yönde taşır, yani chandelier stop başabaşın gerisindeyse reddedilir.
+        if TRAIL_AFTER_TP:
+            pos["trailing_active"] = True
     elif reason == EXIT_TP2:
         pos["tp2_done"] = True
         pos["trailing_active"] = True
