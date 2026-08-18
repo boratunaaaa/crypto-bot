@@ -364,6 +364,35 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     ("M68", "database.py", "Sıfırlama öncesi zarar yine yeni döneme yazılır",
      'if baslangic and str(baslangic) > alt_sinir:',
      'if False:'),
+
+    # 2026-08-18: çoklu strateji deneyi. Buradaki hatalar sessizdir — kapı
+    # gevşerse "kazanan" ilan edilir ve gerçek para en şanslıya gider.
+    ("M69", "strategy_lab.py", "Seçim eşiği yine beklenen-max (kurayı kenar sanır)",
+     '    return NormalDist().inv_cdf(p)',
+     '    return expected_max_of_n(n)'),
+
+    ("M70", "strategy_lab.py", "Etkin örneklem yerine ham işlem sayısı kullanılır",
+     '        sc.std_error = sc.stdev_r / math.sqrt(sc.effective_n)',
+     '        sc.std_error = sc.stdev_r / math.sqrt(sc.trades)'),
+
+    ("M71", "strategy_lab.py", "Çakışan işlemler ayrı gözlem sayılır",
+     '        if z - son > pencere:\n            kume += 1',
+     '        if True:\n            kume += 1'),
+
+    ("M72", "strategy_lab.py", "Kâğıt modda risk ihlali botu durdurur (veri kesilir)",
+     "    return RISK_ACTION_RECORD_ONLY if mode == _MODE_PAPER else RISK_ACTION_HALT",
+     "    return RISK_ACTION_HALT"),
+
+    ("M73", "main.py", "Döngü hatasında stop kontrolü çalışmaz",
+     '''                try:
+                    _watch_positions()
+                except Exception:
+                    logger.exception("Stop kontrolü de başarısız")''',
+     '                pass'),
+
+    ("M74", "main.py", "Döngü hatası yeniden fırlatılır (bot ölür)",
+     '                time.sleep(min(2.0 * _cycle_errors, float(SIGNAL_INTERVAL)))',
+     '                time.sleep(min(2.0 * _cycle_errors, float(SIGNAL_INTERVAL)))\n                raise'),
 ]
 
 

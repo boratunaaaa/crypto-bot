@@ -567,6 +567,8 @@ def run():
     _alloc_of: dict = {p: pos.get("allocated_r", 1.0)
                        for p, pos in getattr(trader, "positions", {}).items()}
     momentum_signals: list = []
+    # Art arda kaç tur hata aldık. Sıfırlanması 'toparlandı' demektir.
+    _cycle_errors     = 0
 
     def _watch_positions() -> None:
         """Açık pozisyonların stop/çıkış kontrolü — sinyal taramasından BAĞIMSIZ.
@@ -595,7 +597,16 @@ def run():
         if not px:
             return
 
-        for sym, reason, pnl, r_mult in trader.check_positions(px):
+        try:
+            kapananlar = trader.check_positions(px)
+        except Exception:
+            # Bu fonksiyon hem normal turda hem HATA turunda çağrılıyor.
+            # Buradan istisna kaçarsa hata işleyicisinin kendisi patlar ve
+            # döngü yine ölür — koruma kendi koruduğu şeyi öldürmemeli.
+            logger.exception("check_positions başarısız")
+            return
+
+        for sym, reason, pnl, r_mult in kapananlar:
             logger.info(f"KAPANDI: {sym} | {reason} | PnL:{pnl:+.2f}$ ({r_mult:+.2f}R)")
             kill_switch.record_trade_close(
                 pnl, _equity(), realized_r=r_mult, symbol=sym,
@@ -606,474 +617,518 @@ def run():
 
     with Live(console=console, refresh_per_second=2, screen=True) as live:
         while running:
-            t0 = time.perf_counter()
-            _last_loop_ts = time.time()
+            try:
+                t0 = time.perf_counter()
+                _last_loop_ts = time.time()
 
-            prices = mdm.get_all_prices()
+                prices = mdm.get_all_prices()
 
-            # Açık pozisyonlar için fiyat tazeliği garantisi (bayat fiyatla
-            # asla stop kontrolü yapma — 2026-08-07 WS olayı)
-            held_positions = getattr(trader, "positions", {})
-            if held_positions:
-                fresh = mdm.get_prices_for(
-                    list(held_positions.keys()), max_age_seconds=MAX_PRICE_AGE_SEC
-                )
-                prices.update(fresh)
-                # DENETİM BULGUSU: REST yenilemesi BAŞARISIZ olursa sözlükteki
-                # eski WebSocket fiyatı yerinde kalıyor ve stop motoru onu
-                # kullanmaya devam ediyordu. Bayat fiyatla stop kararı vermek,
-                # kararı hiç vermemekten kötüdür.
-                #
-                # 2026-08-18: bu koruma yazıldığı günden beri HİÇ çalışmamıştı.
-                # `get_prices_for` varsayılan 90 saniyelik eşikle çağrılıyordu,
-                # yani 89 saniyelik fiyat `fresh` içinde dönüyordu; koruma ise
-                # yalnız `fresh` DIŞINDA kalanlara bakıyordu. Korumanın kendi
-                # eşiği (60s) getirme eşiğinden (90s) sıkı olduğu için elemek
-                # istediği fiyatlar ona hiç ulaşmadı. Artık eşik tek: `fresh`
-                # değilse karar verilmez — "taze değil" ile "kullanılabilir"
-                # arasında boşluk bırakmıyoruz.
-                for _sym in drop_stale_prices(list(held_positions), fresh, prices):
-                    logger.warning(
-                        f"{_sym}: fiyat bayat ({mdm.price_age(_sym):.0f}s) — "
-                        f"bu turda çıkış değerlendirilmiyor"
+                # Açık pozisyonlar için fiyat tazeliği garantisi (bayat fiyatla
+                # asla stop kontrolü yapma — 2026-08-07 WS olayı)
+                held_positions = getattr(trader, "positions", {})
+                if held_positions:
+                    fresh = mdm.get_prices_for(
+                        list(held_positions.keys()), max_age_seconds=MAX_PRICE_AGE_SEC
                     )
-            if hasattr(trader, "mark"):
-                trader.mark(prices)
+                    prices.update(fresh)
+                    # DENETİM BULGUSU: REST yenilemesi BAŞARISIZ olursa sözlükteki
+                    # eski WebSocket fiyatı yerinde kalıyor ve stop motoru onu
+                    # kullanmaya devam ediyordu. Bayat fiyatla stop kararı vermek,
+                    # kararı hiç vermemekten kötüdür.
+                    #
+                    # 2026-08-18: bu koruma yazıldığı günden beri HİÇ çalışmamıştı.
+                    # `get_prices_for` varsayılan 90 saniyelik eşikle çağrılıyordu,
+                    # yani 89 saniyelik fiyat `fresh` içinde dönüyordu; koruma ise
+                    # yalnız `fresh` DIŞINDA kalanlara bakıyordu. Korumanın kendi
+                    # eşiği (60s) getirme eşiğinden (90s) sıkı olduğu için elemek
+                    # istediği fiyatlar ona hiç ulaşmadı. Artık eşik tek: `fresh`
+                    # değilse karar verilmez — "taze değil" ile "kullanılabilir"
+                    # arasında boşluk bırakmıyoruz.
+                    for _sym in drop_stale_prices(list(held_positions), fresh, prices):
+                        logger.warning(
+                            f"{_sym}: fiyat bayat ({mdm.price_age(_sym):.0f}s) — "
+                            f"bu turda çıkış değerlendirilmiyor"
+                        )
+                if hasattr(trader, "mark"):
+                    trader.mark(prices)
 
-            if hasattr(trader, "sync_positions"):
-                trader.sync_positions()
-                # Borsa stopuyla kapanan işlemler kill switch'e İŞLENMELİ.
-                # Gerçek modda en sık kapanış yolu budur; buraya bağlanmazsa
-                # günlük zarar limiti ve ardışık kayıp sayacı kör kalır.
-                for sym, reason, pnl, r_mult, alloc in getattr(trader, "exchange_closed", []):
-                    logger.info(f"BORSA KAPANIŞI: {sym} | {reason} | {pnl:+.2f}$ ({r_mult:+.2f}R)")
-                    kill_switch.record_trade_close(
-                        pnl, _equity(), realized_r=r_mult, symbol=sym, allocated=alloc,
-                    )
-                    tg.notify_close(sym, "", 0.0, pnl, reason)
-                    _alloc_of.pop(sym, None)
-                if getattr(trader, "exchange_closed", None):
-                    trader.exchange_closed.clear()
-                    _save_state()
+                if hasattr(trader, "sync_positions"):
+                    trader.sync_positions()
+                    # Borsa stopuyla kapanan işlemler kill switch'e İŞLENMELİ.
+                    # Gerçek modda en sık kapanış yolu budur; buraya bağlanmazsa
+                    # günlük zarar limiti ve ardışık kayıp sayacı kör kalır.
+                    for sym, reason, pnl, r_mult, alloc in getattr(trader, "exchange_closed", []):
+                        logger.info(f"BORSA KAPANIŞI: {sym} | {reason} | {pnl:+.2f}$ ({r_mult:+.2f}R)")
+                        kill_switch.record_trade_close(
+                            pnl, _equity(), realized_r=r_mult, symbol=sym, allocated=alloc,
+                        )
+                        tg.notify_close(sym, "", 0.0, pnl, reason)
+                        _alloc_of.pop(sym, None)
+                    if getattr(trader, "exchange_closed", None):
+                        trader.exchange_closed.clear()
+                        _save_state()
 
-            if hasattr(trader, "sync_balance"):
+                if hasattr(trader, "sync_balance"):
+                    now = time.perf_counter()
+                    if now - last_balance_sync >= 60:
+                        trader.sync_balance()
+                        last_balance_sync = now
+
+                equity = _equity()
+
+                # ── Çıkış motoru: kısmi çıkış / breakeven / trailing / time-stop ──
+                if hasattr(trader, "check_positions"):
+                    closed = trader.check_positions(prices)
+                    for sym, reason, pnl, r_mult in closed:
+                        logger.info(
+                            f"KAPANDI: {sym} | {reason} | PnL:{pnl:+.2f}$ ({r_mult:+.2f}R)"
+                        )
+                        kill_switch.record_trade_close(
+                            pnl, _equity(), realized_r=r_mult, symbol=sym,
+                            allocated=_alloc_of.pop(sym, 1.0),
+                        )
+                        tg.notify_close(sym, "", prices.get(sym, 0), pnl, reason)
+                    if closed:
+                        _save_state()
+
                 now = time.perf_counter()
-                if now - last_balance_sync >= 60:
-                    trader.sync_balance()
-                    last_balance_sync = now
+                if now - last_btc_check >= 60:
+                    btc_trend = mdm.get_btc_trend()
+                    last_btc_check = now
 
-            equity = _equity()
+                # ── TREND stratejisi taraması ──────────────────────────────────
+                ready   = mdm.ready_symbols()
+                signals = analyze_all(
+                    ready,
+                    get_ohlcv    = mdm.get_ohlcv,
+                    get_price    = mdm.get_price,
+                    get_funding  = mdm.get_funding,
+                    get_oi_trend = mdm.get_oi_trend,
+                    btc_trend    = btc_trend,
+                    max_workers  = 20,
+                )
 
-            # ── Çıkış motoru: kısmi çıkış / breakeven / trailing / time-stop ──
-            if hasattr(trader, "check_positions"):
-                closed = trader.check_positions(prices)
-                for sym, reason, pnl, r_mult in closed:
-                    logger.info(
-                        f"KAPANDI: {sym} | {reason} | PnL:{pnl:+.2f}$ ({r_mult:+.2f}R)"
-                    )
-                    kill_switch.record_trade_close(
-                        pnl, _equity(), realized_r=r_mult, symbol=sym,
-                        allocated=_alloc_of.pop(sym, 1.0),
-                    )
-                    tg.notify_close(sym, "", prices.get(sym, 0), pnl, reason)
-                if closed:
-                    _save_state()
-
-            now = time.perf_counter()
-            if now - last_btc_check >= 60:
-                btc_trend = mdm.get_btc_trend()
-                last_btc_check = now
-
-            # ── TREND stratejisi taraması ──────────────────────────────────
-            ready   = mdm.ready_symbols()
-            signals = analyze_all(
-                ready,
-                get_ohlcv    = mdm.get_ohlcv,
-                get_price    = mdm.get_price,
-                get_funding  = mdm.get_funding,
-                get_oi_trend = mdm.get_oi_trend,
-                btc_trend    = btc_trend,
-                max_workers  = 20,
-            )
-
-            # ── MOMENTUM_FAST taraması ─────────────────────────────────────
-            if MOMENTUM_ENABLED and time.time() - last_momentum >= 60:
-                last_momentum = time.time()
-                try:
-                    if time.time() - last_ticker >= 120:
-                        mdm.refresh_ticker()
-                        mdm.clear_spread_cache()
-                        last_ticker = time.time()
-                    movers = mdm.get_movers(n=25)
-                    if movers:
-                        mdm.refresh_fast_ohlcv(movers)
-                        momentum_signals = momentum_mod.scan(
-                            mdm, movers, btc_change_15m=mdm.get_btc_change_15m()
-                        )
-                        for ms in momentum_signals:
-                            if ms.action == "HOLD":
-                                if ms.reject_reason:
-                                    save_missed_signal(
-                                        ms.symbol, "MOMENTUM", ms.score, ms.confidence,
-                                        f"[MOM] {ms.reject_reason}", btc_trend, "MOMENTUM",
+                # ── MOMENTUM_FAST taraması ─────────────────────────────────────
+                if MOMENTUM_ENABLED and time.time() - last_momentum >= 60:
+                    last_momentum = time.time()
+                    try:
+                        if time.time() - last_ticker >= 120:
+                            mdm.refresh_ticker()
+                            mdm.clear_spread_cache()
+                            last_ticker = time.time()
+                        movers = mdm.get_movers(n=25)
+                        if movers:
+                            mdm.refresh_fast_ohlcv(movers)
+                            momentum_signals = momentum_mod.scan(
+                                mdm, movers, btc_change_15m=mdm.get_btc_change_15m()
+                            )
+                            for ms in momentum_signals:
+                                if ms.action == "HOLD":
+                                    if ms.reject_reason:
+                                        save_missed_signal(
+                                            ms.symbol, "MOMENTUM", ms.score, ms.confidence,
+                                            f"[MOM] {ms.reject_reason}", btc_trend, "MOMENTUM",
+                                        )
+                                    continue
+                                if MOMENTUM_SHADOW_MODE:
+                                    # GÖLGE MOD: işlem açılmaz, yalnız kaydedilir.
+                                    save_shadow_signal(
+                                        ms.symbol, ms.action, ms.score, ms.price, ms.features
                                     )
-                                continue
-                            if MOMENTUM_SHADOW_MODE:
-                                # GÖLGE MOD: işlem açılmaz, yalnız kaydedilir.
-                                save_shadow_signal(
-                                    ms.symbol, ms.action, ms.score, ms.price, ms.features
-                                )
-                                logger.info(
-                                    f"[GÖLGE] MOMENTUM {ms.symbol} {ms.action} "
-                                    f"@{ms.price:.6g} skor:{ms.score} | {ms.reason}"
-                                )
-                except Exception as e:
-                    logger.warning(f"Momentum taraması hatası: {e}")
+                                    logger.info(
+                                        f"[GÖLGE] MOMENTUM {ms.symbol} {ms.action} "
+                                        f"@{ms.price:.6g} skor:{ms.score} | {ms.reason}"
+                                    )
+                    except Exception as e:
+                        logger.warning(f"Momentum taraması hatası: {e}")
 
-            # ── Kill switch ────────────────────────────────────────────────
-            equity = _equity()
-            # Tepe noktası açık pozisyon kârıyla da ilerlemeli.
-            kill_switch.observe_equity(equity)
-            can_trade, ks_reason = kill_switch.can_trade(equity)
-            if not can_trade:
-                # Aynı satırı her turda yazmak logu şişiriyordu: tek bir
-                # kilitte 2,5 günde 7.154 özdeş satır. Sebep değiştiğinde ya da
-                # 15 dakikada bir yaz — kilidin sürdüğü görünür kalsın ama log
-                # okunabilir olsun (bu sunucuda log şişmesi daha önce yaşandı).
-                _now_ts = time.time()
-                if (ks_reason != _ks_last_reason
-                        or _now_ts - _ks_last_log >= 900):
-                    logger.warning(f"KİLL SWİTCH: {ks_reason}")
-                    _ks_last_reason = ks_reason
-                    _ks_last_log = _now_ts
-                if not _ks_notified:
-                    tg.notify_kill_switch(ks_reason)
-                    _ks_notified = True
-            else:
-                _ks_notified = False
-
-            # ── Koruma bütünlüğü ──────────────────────────────────────────
-            # Korumasız veya sahipsiz pozisyon varsa yeni işlem AÇILMAZ. Borsa
-            # tarafındaki koruma, botun belleğindeki stop'tan daha önemlidir:
-            # süreç ölürse bellekteki stop da ölür, borsadaki emir kalır.
-            guard_issues = {
-                **{s: f"korumasız ({r})" for s, r in getattr(trader, "unprotected", {}).items()},
-                **{s: f"sahipsiz ({r})" for s, r in getattr(trader, "orphans", {}).items()},
-                # Borsada gerçekleşmiş ama yerel kayda işlenmemiş dolum /
-                # doğrulanamamış kapanış PnL'i. Kayıt ile borsa ayrıştığı için
-                # pozisyon boyutu da risk hesabı da güvenilmezdir.
-                **{s: f"uzlaştırma gerekli ({r})"
-                   for s, r in getattr(trader, "reconcile_needed", {}).items()},
-                **{s: f"stop doğrulanamıyor ({r})"
-                   for s, r in getattr(trader, "protection_unknown", {}).items()},
-                **{s: "emir akıbeti bilinmiyor"
-                   for s in getattr(trader, "pending_unknown", {})},
-            }
-            if hasattr(trader, "position_sync_ok") and not trader.position_sync_ok:
-                guard_issues["SYSTEM/POSITION_SYNC"] = "borsa pozisyonları doğrulanamıyor"
-            if hasattr(trader, "pending_state_ok") and not trader.pending_state_ok:
-                guard_issues["SYSTEM/PENDING_STATE"] = "emir karantinası okunamıyor/yazılamıyor"
-            if hasattr(trader, "reconcile_state_ok") and not trader.reconcile_state_ok:
-                guard_issues["SYSTEM/RECONCILE_STATE"] = "uzlaştırma durumu okunamıyor/yazılamıyor"
-            if getattr(trader, "equity_stale", False):
-                guard_issues["SYSTEM/EQUITY"] = "canlı equity doğrulanamıyor"
-            if guard_issues:
-                can_trade = False
-                ks_reason = "Koruma bütünlüğü bozuk: " + ", ".join(
-                    f"{s} {r}" for s, r in guard_issues.items()
-                )
-                logger.error(ks_reason)
-                if guard_issues != _guard_notified:
-                    tg.send(
-                        "🚨 KORUMA UYARISI\n\n"
-                        + "\n".join(f"• {s}: {r}" for s, r in guard_issues.items())
-                        + "\n\nYeni işlem açılmayacak. Binance'i elle kontrol et."
-                    )
-                    _guard_notified = dict(guard_issues)
-            elif _guard_notified:
-                tg.send("✅ Koruma bütünlüğü normale döndü.")
-                _guard_notified = {}
-
-            # ── İşlem kararları ───────────────────────────────────────────
-            positions = getattr(trader, "positions", {})
-
-            # MOMENTUM canlı modda ise sinyalleri TREND sinyallerinin önüne al
-            candidates = []
-            if MOMENTUM_ENABLED and not MOMENTUM_SHADOW_MODE:
-                candidates.extend([
-                    s for s in momentum_signals
-                    if s.action in ("BUY", "SELL") and s.score >= MOMENTUM_MIN_SCORE
-                ])
-            candidates.extend(signals)
-
-            for sig in candidates:
-                if not running:
-                    break
-
-                strategy = getattr(sig, "strategy", "TREND")
-                is_trade_signal = (
-                    sig.action in ("BUY", "SELL")
-                    and getattr(sig, "confidence", 0) >= (
-                        MIN_CONFIDENCE if strategy == "TREND" else MOMENTUM_MIN_SCORE / 100
-                    )
-                )
-                if not is_trade_signal:
-                    continue
-
-                # Açılamama sebeplerini kaydet (missed_signals)
-                missed_reason = None
-                if not can_trade or tg.is_paused:
-                    missed_reason = ks_reason if not can_trade else "Telegram /pause"
+                # ── Kill switch ────────────────────────────────────────────────
+                equity = _equity()
+                # Tepe noktası açık pozisyon kârıyla da ilerlemeli.
+                kill_switch.observe_equity(equity)
+                can_trade, ks_reason = kill_switch.can_trade(equity)
+                if not can_trade:
+                    # Aynı satırı her turda yazmak logu şişiriyordu: tek bir
+                    # kilitte 2,5 günde 7.154 özdeş satır. Sebep değiştiğinde ya da
+                    # 15 dakikada bir yaz — kilidin sürdüğü görünür kalsın ama log
+                    # okunabilir olsun (bu sunucuda log şişmesi daha önce yaşandı).
+                    _now_ts = time.time()
+                    if (ks_reason != _ks_last_reason
+                            or _now_ts - _ks_last_log >= 900):
+                        logger.warning(f"KİLL SWİTCH: {ks_reason}")
+                        _ks_last_reason = ks_reason
+                        _ks_last_log = _now_ts
+                    if not _ks_notified:
+                        tg.notify_kill_switch(ks_reason)
+                        _ks_notified = True
                 else:
-                    ok_port, port_reason = can_add_position(positions, equity)
-                    if not ok_port:
-                        missed_reason = port_reason
-                    elif sig.symbol in positions:
-                        missed_reason = "Zaten açık pozisyon var"
-                    elif kill_switch.symbol_on_cooldown(sig.symbol):
-                        missed_reason = "Sembol soğuma süresinde"
+                    _ks_notified = False
 
-                if missed_reason:
-                    save_missed_signal(
-                        sig.symbol, sig.action, sig.score, sig.confidence,
-                        missed_reason, btc_trend, sig.market_regime,
-                    )
-                    if not can_trade or tg.is_paused:
-                        break
-                    continue
-
-                if sig.symbol == "BTCUSDT":
-                    continue
-
-                same_dir = sum(1 for p in positions.values() if p["side"] == sig.action)
-                if same_dir >= MAX_CORRELATED_POSITIONS:
-                    save_missed_signal(
-                        sig.symbol, sig.action, sig.score, sig.confidence,
-                        f"Korelasyon limiti ({same_dir}/{MAX_CORRELATED_POSITIONS} {sig.action})",
-                        btc_trend, sig.market_regime,
-                    )
-                    continue
-
-                # Bu adayın gerçek risk ağırlığı. Korelasyon kapısı da bunu
-                # kullanmalı: %0.4 riskli işlemle %1.2 riskli işlem aynı
-                # maruziyeti üretmez.
-                _risk_pct_probe = dynamic_risk_pct(get_recent_pnls(30), sig.score)
-                alloc_r = allocated_r(_risk_pct_probe)
-
-                # Gerçek korelasyon kapısı — sayı değil, BİRLİKTE HAREKET.
-                # Yön limiti (MAX_CORRELATED_POSITIONS) 4 alt long'a izin verir;
-                # BTC %5 düşerse dördü birden stop olur. Bu kapı onu ölçer.
-                if CORRELATION_GUARD_ENABLED and positions:
-                    betas = _betas_for(list(positions.keys()) + [sig.symbol])
-                    ok_corr, corr_reason = corr.can_add_correlated(
-                        positions, sig.symbol, sig.action, alloc_r, betas,
-                        max_net_r=MAX_NET_DIRECTIONAL_R,
-                        max_stress_r=MAX_STRESS_LOSS_R,
-                        shock_pct=STRESS_SHOCK_PCT,
-                    )
-                    if not ok_corr:
-                        save_missed_signal(
-                            sig.symbol, sig.action, sig.score, sig.confidence,
-                            corr_reason, btc_trend, sig.market_regime,
-                        )
-                        continue
-
-                # Momentum stratejisi kendi izole bütçesini aşamaz
-                if strategy == "MOMENTUM_FAST":
-                    ok_mom, mom_reason = kill_switch.can_trade(equity, strategy="MOMENTUM_FAST")
-                    # DENETİM: alt bütçe ADAY DAHİL EDİLMEDEN kontrol
-                    # ediliyordu — kalan 0.4R iken 1.3R'lik aday kabul
-                    # edilebiliyordu. Ana bütçede bu kontrol vardı, alt
-                    # bütçede atlanmıştı.
-                    if ok_mom and kill_switch.momentum_budget_remaining() < alloc_r:
-                        ok_mom = False
-                        mom_reason = (
-                            f"Momentum bütçesi yetersiz "
-                            f"({kill_switch.momentum_budget_remaining():.2f}R < {alloc_r:.2f}R)"
-                        )
-                    if not ok_mom:
-                        save_missed_signal(
-                            sig.symbol, sig.action, sig.score, sig.confidence,
-                            f"[MOM] {mom_reason}", btc_trend, "MOMENTUM",
-                        )
-                        continue
-
-                # Spread kontrolü — geniş spread'de execution kalitesi düşer
-                spread = mdm.get_spread_pct(sig.symbol)
-                if spread is not None and spread > MAX_SPREAD_PCT:
-                    save_missed_signal(
-                        sig.symbol, sig.action, sig.score, sig.confidence,
-                        f"Spread geniş (%{spread*100:.2f})", btc_trend, sig.market_regime,
-                    )
-                    continue
-
-                leverage = calculate_leverage(sig.confidence, sig.score)
-                risk_pct = _risk_pct_probe
-                open_margin = sum(p.get("margin", 0.0) for p in positions.values())
-
-                # DENETİM: `can_trade` aday DÖNGÜSÜNDEN ÖNCE bir kez
-                # çalışıyordu. Aynı taramada arka arkaya açılan pozisyonlar
-                # günlük 8R bütçesini aşabiliyordu. Her adaydan hemen önce,
-                # o adayın GERÇEK riskiyle yeniden kontrol ediliyor.
-                ok_budget, budget_reason = kill_switch.can_trade(equity, strategy=strategy)
-                if not ok_budget or kill_switch.risk_budget_remaining() < alloc_r:
-                    save_missed_signal(
-                        sig.symbol, sig.action, sig.score, sig.confidence,
-                        budget_reason if not ok_budget else
-                        f"Bütçe yetersiz ({kill_switch.risk_budget_remaining():.1f}R < {alloc_r:.1f}R)",
-                        btc_trend, sig.market_regime,
-                    )
-                    continue
-
-                ok_port, port_reason = can_add_position(positions, equity, new_risk_r=alloc_r)
-                if not ok_port:
-                    save_missed_signal(
-                        sig.symbol, sig.action, sig.score, sig.confidence,
-                        port_reason, btc_trend, sig.market_regime,
-                    )
-                    continue
-
-                # Bayat fiyatla pozisyon açma — sinyal üretimi ile emir arasında
-                # WebSocket düşmüş olabilir.
-                fresh_px = mdm.get_price(sig.symbol)
-                if fresh_px is None:
-                    # DENETİM BULGUSU (2026-08-16): açık pozisyonlar için REST
-                    # yedeği vardı, GİRİŞ için yoktu. WS kütüphanesi sürüm
-                    # uyumsuzluğu yüzünden akış dakikalar boyunca kesilebiliyor;
-                    # o pencerede her sinyal "Fiyat bayat" diye çöpe gidiyordu.
-                    # Sinyal nadirdir — tek bir REST çağrısı ucuz, kaçan fırsat
-                    # pahalı. Tazelik kuralı korunuyor: REST de veremezse giriş
-                    # YİNE yapılmaz.
-                    fresh_px = mdm.get_prices_for(
-                        [sig.symbol], max_age_seconds=MAX_PRICE_AGE_SEC
-                    ).get(sig.symbol)
-                if fresh_px is None:
-                    save_missed_signal(
-                        sig.symbol, sig.action, sig.score, sig.confidence,
-                        f"Fiyat bayat ({mdm.price_age(sig.symbol):.0f}s)",
-                        btc_trend, sig.market_regime,
-                    )
-                    continue
-
-                margin, qty, risk_amount, err = calculate_position(
-                    equity, leverage, sig.price, sig.sl, risk_pct,
-                    open_margin_total=open_margin,
-                )
-                if err:
-                    save_missed_signal(
-                        sig.symbol, sig.action, sig.score, sig.confidence,
-                        err, btc_trend, sig.market_regime,
-                    )
-                    continue
-
-                snapshot = {
-                    "score": sig.score, "confidence": sig.confidence,
-                    "risk_pct": risk_pct, "leverage": leverage,
-                    "btc_trend": btc_trend, "regime": sig.market_regime,
-                    "atr_pct": getattr(sig, "atr_pct", 0.0),
-                    "spread": spread, "equity": equity,
-                    "stop_distance_pct": abs(sig.price - sig.sl) / sig.price,
-                    "fear_greed": sentiment.value,
+                # ── Koruma bütünlüğü ──────────────────────────────────────────
+                # Korumasız veya sahipsiz pozisyon varsa yeni işlem AÇILMAZ. Borsa
+                # tarafındaki koruma, botun belleğindeki stop'tan daha önemlidir:
+                # süreç ölürse bellekteki stop da ölür, borsadaki emir kalır.
+                guard_issues = {
+                    **{s: f"korumasız ({r})" for s, r in getattr(trader, "unprotected", {}).items()},
+                    **{s: f"sahipsiz ({r})" for s, r in getattr(trader, "orphans", {}).items()},
+                    # Borsada gerçekleşmiş ama yerel kayda işlenmemiş dolum /
+                    # doğrulanamamış kapanış PnL'i. Kayıt ile borsa ayrıştığı için
+                    # pozisyon boyutu da risk hesabı da güvenilmezdir.
+                    **{s: f"uzlaştırma gerekli ({r})"
+                       for s, r in getattr(trader, "reconcile_needed", {}).items()},
+                    **{s: f"stop doğrulanamıyor ({r})"
+                       for s, r in getattr(trader, "protection_unknown", {}).items()},
+                    **{s: "emir akıbeti bilinmiyor"
+                       for s in getattr(trader, "pending_unknown", {})},
                 }
-                if strategy == "MOMENTUM_FAST":
-                    snapshot["momentum_features"] = getattr(sig, "features", {})
-
-                ok, msg = trader.open_position(
-                    sig.symbol, sig.action, sig.price,
-                    margin, leverage, sig.sl, sig.tp,
-                    reason=sig.reason, score=sig.score,
-                    btc_trend=btc_trend,
-                    market_regime=sig.market_regime,
-                    atr_pct=getattr(sig, "atr_pct", 0.0),
-                    fear_greed=sentiment.value,
-                    strategy=strategy, qty=qty, risk_amount=risk_amount,
-                    entry_snapshot=snapshot,
-                )
-                if ok:
-                    kill_switch.record_trade_open(equity, risk_r=alloc_r, strategy=strategy)
-                    if sig.symbol in trader.positions:
-                        trader.positions[sig.symbol]["allocated_r"] = alloc_r
-                    _alloc_of[sig.symbol] = alloc_r
-                    positions = trader.positions
-                    logger.info(
-                        f"AÇILDI [{strategy}]: {sig.symbol} {sig.action} "
-                        f"@{sig.price:.5g} | {leverage}x | "
-                        f"Marjin:{margin:.1f}$ Risk:{risk_amount:.2f}$ | "
-                        f"SL:{sig.sl:.5g} | Skor:{sig.score}/100 | "
-                        f"Bütçe:{kill_switch.daily_risk_used_r:.1f}R | {sig.reason}"
+                if hasattr(trader, "position_sync_ok") and not trader.position_sync_ok:
+                    guard_issues["SYSTEM/POSITION_SYNC"] = "borsa pozisyonları doğrulanamıyor"
+                if hasattr(trader, "pending_state_ok") and not trader.pending_state_ok:
+                    guard_issues["SYSTEM/PENDING_STATE"] = "emir karantinası okunamıyor/yazılamıyor"
+                if hasattr(trader, "reconcile_state_ok") and not trader.reconcile_state_ok:
+                    guard_issues["SYSTEM/RECONCILE_STATE"] = "uzlaştırma durumu okunamıyor/yazılamıyor"
+                if getattr(trader, "equity_stale", False):
+                    guard_issues["SYSTEM/EQUITY"] = "canlı equity doğrulanamıyor"
+                if guard_issues:
+                    can_trade = False
+                    ks_reason = "Koruma bütünlüğü bozuk: " + ", ".join(
+                        f"{s} {r}" for s, r in guard_issues.items()
                     )
-                    tg.notify_open(
+                    logger.error(ks_reason)
+                    if guard_issues != _guard_notified:
+                        tg.send(
+                            "🚨 KORUMA UYARISI\n\n"
+                            + "\n".join(f"• {s}: {r}" for s, r in guard_issues.items())
+                            + "\n\nYeni işlem açılmayacak. Binance'i elle kontrol et."
+                        )
+                        _guard_notified = dict(guard_issues)
+                elif _guard_notified:
+                    tg.send("✅ Koruma bütünlüğü normale döndü.")
+                    _guard_notified = {}
+
+                # ── İşlem kararları ───────────────────────────────────────────
+                positions = getattr(trader, "positions", {})
+
+                # MOMENTUM canlı modda ise sinyalleri TREND sinyallerinin önüne al
+                candidates = []
+                if MOMENTUM_ENABLED and not MOMENTUM_SHADOW_MODE:
+                    candidates.extend([
+                        s for s in momentum_signals
+                        if s.action in ("BUY", "SELL") and s.score >= MOMENTUM_MIN_SCORE
+                    ])
+                candidates.extend(signals)
+
+                for sig in candidates:
+                    if not running:
+                        break
+
+                    strategy = getattr(sig, "strategy", "TREND")
+                    is_trade_signal = (
+                        sig.action in ("BUY", "SELL")
+                        and getattr(sig, "confidence", 0) >= (
+                            MIN_CONFIDENCE if strategy == "TREND" else MOMENTUM_MIN_SCORE / 100
+                        )
+                    )
+                    if not is_trade_signal:
+                        continue
+
+                    # Açılamama sebeplerini kaydet (missed_signals)
+                    missed_reason = None
+                    if not can_trade or tg.is_paused:
+                        missed_reason = ks_reason if not can_trade else "Telegram /pause"
+                    else:
+                        ok_port, port_reason = can_add_position(positions, equity)
+                        if not ok_port:
+                            missed_reason = port_reason
+                        elif sig.symbol in positions:
+                            missed_reason = "Zaten açık pozisyon var"
+                        elif kill_switch.symbol_on_cooldown(sig.symbol):
+                            missed_reason = "Sembol soğuma süresinde"
+
+                    if missed_reason:
+                        save_missed_signal(
+                            sig.symbol, sig.action, sig.score, sig.confidence,
+                            missed_reason, btc_trend, sig.market_regime,
+                        )
+                        if not can_trade or tg.is_paused:
+                            break
+                        continue
+
+                    if sig.symbol == "BTCUSDT":
+                        continue
+
+                    same_dir = sum(1 for p in positions.values() if p["side"] == sig.action)
+                    if same_dir >= MAX_CORRELATED_POSITIONS:
+                        save_missed_signal(
+                            sig.symbol, sig.action, sig.score, sig.confidence,
+                            f"Korelasyon limiti ({same_dir}/{MAX_CORRELATED_POSITIONS} {sig.action})",
+                            btc_trend, sig.market_regime,
+                        )
+                        continue
+
+                    # Bu adayın gerçek risk ağırlığı. Korelasyon kapısı da bunu
+                    # kullanmalı: %0.4 riskli işlemle %1.2 riskli işlem aynı
+                    # maruziyeti üretmez.
+                    _risk_pct_probe = dynamic_risk_pct(get_recent_pnls(30), sig.score)
+                    alloc_r = allocated_r(_risk_pct_probe)
+
+                    # Gerçek korelasyon kapısı — sayı değil, BİRLİKTE HAREKET.
+                    # Yön limiti (MAX_CORRELATED_POSITIONS) 4 alt long'a izin verir;
+                    # BTC %5 düşerse dördü birden stop olur. Bu kapı onu ölçer.
+                    if CORRELATION_GUARD_ENABLED and positions:
+                        betas = _betas_for(list(positions.keys()) + [sig.symbol])
+                        ok_corr, corr_reason = corr.can_add_correlated(
+                            positions, sig.symbol, sig.action, alloc_r, betas,
+                            max_net_r=MAX_NET_DIRECTIONAL_R,
+                            max_stress_r=MAX_STRESS_LOSS_R,
+                            shock_pct=STRESS_SHOCK_PCT,
+                        )
+                        if not ok_corr:
+                            save_missed_signal(
+                                sig.symbol, sig.action, sig.score, sig.confidence,
+                                corr_reason, btc_trend, sig.market_regime,
+                            )
+                            continue
+
+                    # Momentum stratejisi kendi izole bütçesini aşamaz
+                    if strategy == "MOMENTUM_FAST":
+                        ok_mom, mom_reason = kill_switch.can_trade(equity, strategy="MOMENTUM_FAST")
+                        # DENETİM: alt bütçe ADAY DAHİL EDİLMEDEN kontrol
+                        # ediliyordu — kalan 0.4R iken 1.3R'lik aday kabul
+                        # edilebiliyordu. Ana bütçede bu kontrol vardı, alt
+                        # bütçede atlanmıştı.
+                        if ok_mom and kill_switch.momentum_budget_remaining() < alloc_r:
+                            ok_mom = False
+                            mom_reason = (
+                                f"Momentum bütçesi yetersiz "
+                                f"({kill_switch.momentum_budget_remaining():.2f}R < {alloc_r:.2f}R)"
+                            )
+                        if not ok_mom:
+                            save_missed_signal(
+                                sig.symbol, sig.action, sig.score, sig.confidence,
+                                f"[MOM] {mom_reason}", btc_trend, "MOMENTUM",
+                            )
+                            continue
+
+                    # Spread kontrolü — geniş spread'de execution kalitesi düşer
+                    spread = mdm.get_spread_pct(sig.symbol)
+                    if spread is not None and spread > MAX_SPREAD_PCT:
+                        save_missed_signal(
+                            sig.symbol, sig.action, sig.score, sig.confidence,
+                            f"Spread geniş (%{spread*100:.2f})", btc_trend, sig.market_regime,
+                        )
+                        continue
+
+                    leverage = calculate_leverage(sig.confidence, sig.score)
+                    risk_pct = _risk_pct_probe
+                    open_margin = sum(p.get("margin", 0.0) for p in positions.values())
+
+                    # DENETİM: `can_trade` aday DÖNGÜSÜNDEN ÖNCE bir kez
+                    # çalışıyordu. Aynı taramada arka arkaya açılan pozisyonlar
+                    # günlük 8R bütçesini aşabiliyordu. Her adaydan hemen önce,
+                    # o adayın GERÇEK riskiyle yeniden kontrol ediliyor.
+                    ok_budget, budget_reason = kill_switch.can_trade(equity, strategy=strategy)
+                    if not ok_budget or kill_switch.risk_budget_remaining() < alloc_r:
+                        save_missed_signal(
+                            sig.symbol, sig.action, sig.score, sig.confidence,
+                            budget_reason if not ok_budget else
+                            f"Bütçe yetersiz ({kill_switch.risk_budget_remaining():.1f}R < {alloc_r:.1f}R)",
+                            btc_trend, sig.market_regime,
+                        )
+                        continue
+
+                    ok_port, port_reason = can_add_position(positions, equity, new_risk_r=alloc_r)
+                    if not ok_port:
+                        save_missed_signal(
+                            sig.symbol, sig.action, sig.score, sig.confidence,
+                            port_reason, btc_trend, sig.market_regime,
+                        )
+                        continue
+
+                    # Bayat fiyatla pozisyon açma — sinyal üretimi ile emir arasında
+                    # WebSocket düşmüş olabilir.
+                    fresh_px = mdm.get_price(sig.symbol)
+                    if fresh_px is None:
+                        # DENETİM BULGUSU (2026-08-16): açık pozisyonlar için REST
+                        # yedeği vardı, GİRİŞ için yoktu. WS kütüphanesi sürüm
+                        # uyumsuzluğu yüzünden akış dakikalar boyunca kesilebiliyor;
+                        # o pencerede her sinyal "Fiyat bayat" diye çöpe gidiyordu.
+                        # Sinyal nadirdir — tek bir REST çağrısı ucuz, kaçan fırsat
+                        # pahalı. Tazelik kuralı korunuyor: REST de veremezse giriş
+                        # YİNE yapılmaz.
+                        fresh_px = mdm.get_prices_for(
+                            [sig.symbol], max_age_seconds=MAX_PRICE_AGE_SEC
+                        ).get(sig.symbol)
+                    if fresh_px is None:
+                        save_missed_signal(
+                            sig.symbol, sig.action, sig.score, sig.confidence,
+                            f"Fiyat bayat ({mdm.price_age(sig.symbol):.0f}s)",
+                            btc_trend, sig.market_regime,
+                        )
+                        continue
+
+                    margin, qty, risk_amount, err = calculate_position(
+                        equity, leverage, sig.price, sig.sl, risk_pct,
+                        open_margin_total=open_margin,
+                    )
+                    if err:
+                        save_missed_signal(
+                            sig.symbol, sig.action, sig.score, sig.confidence,
+                            err, btc_trend, sig.market_regime,
+                        )
+                        continue
+
+                    snapshot = {
+                        "score": sig.score, "confidence": sig.confidence,
+                        "risk_pct": risk_pct, "leverage": leverage,
+                        "btc_trend": btc_trend, "regime": sig.market_regime,
+                        "atr_pct": getattr(sig, "atr_pct", 0.0),
+                        "spread": spread, "equity": equity,
+                        "stop_distance_pct": abs(sig.price - sig.sl) / sig.price,
+                        "fear_greed": sentiment.value,
+                    }
+                    if strategy == "MOMENTUM_FAST":
+                        snapshot["momentum_features"] = getattr(sig, "features", {})
+
+                    ok, msg = trader.open_position(
                         sig.symbol, sig.action, sig.price,
                         margin, leverage, sig.sl, sig.tp,
-                        sig.score, sig.market_regime,
-                        f"{sentiment.value} ({sentiment.label})",
+                        reason=sig.reason, score=sig.score,
+                        btc_trend=btc_trend,
+                        market_regime=sig.market_regime,
+                        atr_pct=getattr(sig, "atr_pct", 0.0),
+                        fear_greed=sentiment.value,
+                        strategy=strategy, qty=qty, risk_amount=risk_amount,
+                        entry_snapshot=snapshot,
                     )
+                    if ok:
+                        kill_switch.record_trade_open(equity, risk_r=alloc_r, strategy=strategy)
+                        if sig.symbol in trader.positions:
+                            trader.positions[sig.symbol]["allocated_r"] = alloc_r
+                        _alloc_of[sig.symbol] = alloc_r
+                        positions = trader.positions
+                        logger.info(
+                            f"AÇILDI [{strategy}]: {sig.symbol} {sig.action} "
+                            f"@{sig.price:.5g} | {leverage}x | "
+                            f"Marjin:{margin:.1f}$ Risk:{risk_amount:.2f}$ | "
+                            f"SL:{sig.sl:.5g} | Skor:{sig.score}/100 | "
+                            f"Bütçe:{kill_switch.daily_risk_used_r:.1f}R | {sig.reason}"
+                        )
+                        tg.notify_open(
+                            sig.symbol, sig.action, sig.price,
+                            margin, leverage, sig.sl, sig.tp,
+                            sig.score, sig.market_regime,
+                            f"{sentiment.value} ({sentiment.label})",
+                        )
+                        _save_state()
+                    else:
+                        logger.warning(f"Açılamadı {sig.symbol}: {msg}")
+
+                # ── Gölge sinyal değerlendirmesi ───────────────────────────────
+                # DENETİM: gölge sinyaller kaydediliyor ama sonuçları HİÇ
+                # değerlendirilmiyordu; kayıtlar sonsuza kadar PENDING kalıyordu.
+                # Yani momentum stratejisini canlıya almak için gereken kanıt
+                # hiç üretilmiyordu.
+                if time.time() - last_shadow_eval >= 300:
+                    try:
+                        _evaluate_shadow_signals(mdm)
+                    except Exception as e:
+                        logger.debug(f"Gölge değerlendirme hatası: {e}")
+                    last_shadow_eval = time.time()
+
+                # ── Periyodik state kaydı + equity örneklemesi ─────────────────
+                if time.time() - last_state_save >= 60:
                     _save_state()
-                else:
-                    logger.warning(f"Açılamadı {sig.symbol}: {msg}")
+                    # Gerçek drawdown yalnız kapanmış işlemlerden ölçülemez; açık
+                    # pozisyonun anlık zararını görebilmek için düzenli örnek şart.
+                    save_equity_snapshot(
+                        equity=_equity(),
+                        balance=trader.balance if isinstance(trader, PaperPortfolio)
+                                else trader.get_balance(),
+                        open_positions=len(getattr(trader, "positions", {})),
+                        open_risk_r=portfolio_open_risk_r(getattr(trader, "positions", {})),
+                        mode="paper" if PAPER_TRADING else "live",
+                    )
+                    last_state_save = time.time()
 
-            # ── Gölge sinyal değerlendirmesi ───────────────────────────────
-            # DENETİM: gölge sinyaller kaydediliyor ama sonuçları HİÇ
-            # değerlendirilmiyordu; kayıtlar sonsuza kadar PENDING kalıyordu.
-            # Yani momentum stratejisini canlıya almak için gereken kanıt
-            # hiç üretilmiyordu.
-            if time.time() - last_shadow_eval >= 300:
-                try:
-                    _evaluate_shadow_signals(mdm)
-                except Exception as e:
-                    logger.debug(f"Gölge değerlendirme hatası: {e}")
-                last_shadow_eval = time.time()
+                # ── Dashboard ───────────────────────────────────────────────────
+                loop_ms   = (time.perf_counter() - t0) * 1000
+                balance   = trader.balance if isinstance(trader, PaperPortfolio) else trader.get_balance()
+                total_pnl = getattr(trader, "total_pnl", 0.0)
+                win_rate  = getattr(trader, "win_rate", 0.0)
+                positions = getattr(trader, "positions", {})
+                trade_log = getattr(trader, "trade_log", [])
 
-            # ── Periyodik state kaydı + equity örneklemesi ─────────────────
-            if time.time() - last_state_save >= 60:
-                _save_state()
-                # Gerçek drawdown yalnız kapanmış işlemlerden ölçülemez; açık
-                # pozisyonun anlık zararını görebilmek için düzenli örnek şart.
-                save_equity_snapshot(
-                    equity=_equity(),
-                    balance=trader.balance if isinstance(trader, PaperPortfolio)
-                            else trader.get_balance(),
-                    open_positions=len(getattr(trader, "positions", {})),
-                    open_risk_r=portfolio_open_risk_r(getattr(trader, "positions", {})),
-                    mode="paper" if PAPER_TRADING else "live",
+                layout = build_layout(
+                    signals, positions, balance, total_pnl,
+                    trade_log, PAPER_TRADING,
+                    loop_ms         = loop_ms,
+                    ready_count     = len(ready),
+                    total_count     = len(mdm.get_symbols()),
+                    win_rate        = win_rate,
+                    initial_balance = PAPER_BALANCE,
+                    kill_switch     = kill_switch,
+                    btc_trend       = btc_trend,
+                    sentiment       = sentiment,
                 )
-                last_state_save = time.time()
+                live.update(layout)
 
-            # ── Dashboard ───────────────────────────────────────────────────
-            loop_ms   = (time.perf_counter() - t0) * 1000
-            balance   = trader.balance if isinstance(trader, PaperPortfolio) else trader.get_balance()
-            total_pnl = getattr(trader, "total_pnl", 0.0)
-            win_rate  = getattr(trader, "win_rate", 0.0)
-            positions = getattr(trader, "positions", {})
-            trade_log = getattr(trader, "trade_log", [])
+                elapsed   = time.perf_counter() - t0
+                sleep_for = max(0.0, SIGNAL_INTERVAL - elapsed)
+                # Beklerken uyumak yerine pozisyonları izle: bekleme süresi
+                # POSITION_CHECK_INTERVAL'lık dilimlere bölünür ve her dilimde
+                # yalnız açık pozisyonların stopları kontrol edilir. Sinyal
+                # taraması yine SIGNAL_INTERVAL'da bir çalışır.
+                _slept = 0.0
+                while running and _slept < sleep_for:
+                    _slice = min(POSITION_CHECK_INTERVAL, sleep_for - _slept)
+                    time.sleep(_slice)
+                    _slept += _slice
+                    if running:
+                        _watch_positions()
+            except Exception as exc:
+                # ── DÖNGÜ ÖLMEZ ────────────────────────────────────────────
+                # Eskiden gövdede genel istisna koruması YOKTU: tek bir
+                # beklenmedik hata (bozuk API cevabı, bir göstergede KeyError,
+                # geçici ağ kesintisi) süreci öldürüyordu. systemd 15 saniye
+                # sonra yeniden başlatıyor, üstüne ~35 saniye piyasa verisi
+                # ısınması biniyordu — yani açık pozisyonlar yaklaşık BİR
+                # DAKİKA boyunca stopsuz kalıyordu. Ölüm sessizdi de: dışarıdan
+                # "servis yeniden başladı" görünüyordu, "pozisyonlar korumasız
+                # kaldı" görünmüyordu.
+                _cycle_errors += 1
+                logger.error(
+                    f"Döngü hatası ({_cycle_errors}. kez): "
+                    f"{type(exc).__name__}: {exc}",
+                    exc_info=True,
+                )
+                # İlk hatada ve her 20 hatada bir haber ver; her turda bildirim
+                # göndermek gürültü üretir ve gürültü görmezden gelinir.
+                if _cycle_errors == 1 or _cycle_errors % 20 == 0:
+                    try:
+                        tg.send(
+                            f"⚠️ <b>DÖNGÜ HATASI</b> ({_cycle_errors}. kez)\n"
+                            f"{type(exc).__name__}: {str(exc)[:200]}\n"
+                            f"Bot çalışmaya devam ediyor; stop kontrolü sürüyor."
+                        )
+                    except Exception:
+                        pass
 
-            layout = build_layout(
-                signals, positions, balance, total_pnl,
-                trade_log, PAPER_TRADING,
-                loop_ms         = loop_ms,
-                ready_count     = len(ready),
-                total_count     = len(mdm.get_symbols()),
-                win_rate        = win_rate,
-                initial_balance = PAPER_BALANCE,
-                kill_switch     = kill_switch,
-                btc_trend       = btc_trend,
-                sentiment       = sentiment,
-            )
-            live.update(layout)
-
-            elapsed   = time.perf_counter() - t0
-            sleep_for = max(0.0, SIGNAL_INTERVAL - elapsed)
-            # Beklerken uyumak yerine pozisyonları izle: bekleme süresi
-            # POSITION_CHECK_INTERVAL'lık dilimlere bölünür ve her dilimde
-            # yalnız açık pozisyonların stopları kontrol edilir. Sinyal
-            # taraması yine SIGNAL_INTERVAL'da bir çalışır.
-            _slept = 0.0
-            while running and _slept < sleep_for:
-                _slice = min(POSITION_CHECK_INTERVAL, sleep_for - _slept)
-                time.sleep(_slice)
-                _slept += _slice
-                if running:
+                # EN ÖNEMLİSİ: tarama çökse bile STOP KONTROLÜ SÜRER.
+                # Sinyal taraması pahalı ve kırılgan, stop kontrolü ucuz ve
+                # hayati. Pahalı olanın hatası ucuz olanı durdurmamalı.
+                try:
                     _watch_positions()
+                except Exception:
+                    logger.exception("Stop kontrolü de başarısız")
+
+                # Sıcak döngü olmasın: art arda hata varsa yavaşla (üst sınır
+                # SIGNAL_INTERVAL — bekleme süresiz uzayıp bot fiilen ölmesin).
+                time.sleep(min(2.0 * _cycle_errors, float(SIGNAL_INTERVAL)))
+            else:
+                if _cycle_errors:
+                    logger.info(f"Döngü toparlandı ({_cycle_errors} hatadan sonra)")
+                    _cycle_errors = 0
 
     _save_state()
     mdm.stop()
