@@ -145,3 +145,43 @@ def test_stop_kontrolu_kendi_icinde_de_korumali():
         "_watch_positions korumasız — hata işleyicisinden çağrıldığında "
         "patlarsa döngü yine ölür"
     )
+
+
+# ── Kill switch deneyi durdurmamalı ───────────────────────────────────────────
+# 2026-08-18 canlı testte yakalandı: kill switch GLOBAL. TREND'in 4 ardışık
+# zararı BEŞ stratejinin hepsini birden durdurdu — henüz tek işlem bile
+# açmamış olanları dahil. "1.4 saat sonra yeniden denenecek" dedi ve deney
+# durdu. İki ayrı sorun: (1) bir stratejinin kötü serisi diğerlerinin veri
+# toplamasını kesiyorsa ölçtüğümüz şey bulaşmadır, (2) zarar ederken durdurmak
+# kötü sonuç kuyruğunu keser ve stratejiyi olduğundan iyi gösterir.
+
+def test_kagit_modda_kill_switch_DURDURMAZ_kaydeder():
+    """Kâğıtta korunacak gerçek sermaye yok; kesilen tek şey veri akışı olur."""
+    assert "if not can_trade and PAPER_TRADING:" in _KAYNAK, (
+        "kill switch kâğıt modda hâlâ bağlayıcı — bir stratejinin zararı "
+        "beş stratejinin veri toplamasını birden keser"
+    )
+    assert "can_trade = True" in _KAYNAK
+    assert "record_risk_event" in _KAYNAK, (
+        "olay kaydedilmiyor — işlem durmadığı için tek iz bu kayıttır"
+    )
+
+
+def test_kagit_modda_risk_butcesi_de_baglamaz():
+    """Portföyleri ayırıp bütçeyi ortak bırakmak ayrımı yarım bırakmaktır."""
+    assert "if PAPER_TRADING and (not ok_budget or _butce_yetersiz):" in _KAYNAK
+
+
+def test_GERCEK_modda_kill_switch_AYNEN_baglayici():
+    """Kâğıt gevşemesi gerçek para yoluna sızmamalı."""
+    yer = _KAYNAK.index("if not can_trade and PAPER_TRADING:")
+    # Gevşetme PAPER_TRADING koşuluna bağlı olmalı; koşulsuz `can_trade = True`
+    # olsaydı gerçek modda da limit kalkardı.
+    bolum = _KAYNAK[yer:yer + 2000]
+    assert "PAPER_TRADING" in bolum
+    assert bolum.count("can_trade = True") == 1
+
+
+def test_kill_switch_olayi_yine_LOGLANIYOR():
+    """Sessizce geçilirse limitin çalıştığı hiç görünmez."""
+    assert "KİLL SWİTCH (kâğıt — KAYDEDİLDİ, durdurulmadı)" in _KAYNAK

@@ -487,6 +487,14 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     ("M92", "config.py", "Bar sayisi stratejilerin ihtiyacindan az (sessiz olum)",
      'CANDLE_LIMIT = 250',
      'CANDLE_LIMIT = 120'),
+
+    ("M93", "main.py", "Kill switch kagit modda da tum stratejileri durdurur",
+     'if not can_trade and PAPER_TRADING:',
+     'if False:'),
+
+    ("M94", "main.py", "Risk butcesi kagit modda da baglar (deney bulasir)",
+     'if PAPER_TRADING and (not ok_budget or _butce_yetersiz):',
+     'if False:'),
 ]
 
 

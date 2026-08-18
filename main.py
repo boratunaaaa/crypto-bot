@@ -826,6 +826,45 @@ def run():
                 # Tepe noktası açık pozisyon kârıyla da ilerlemeli.
                 kill_switch.observe_equity(equity)
                 can_trade, ks_reason = kill_switch.can_trade(equity)
+
+                # ── KÂĞIT MODDA KİLL SWITCH DURDURMAZ, KAYDEDER ──────────────
+                # 2026-08-18 canlı testte yakalandı: kill switch GLOBAL. TREND'in
+                # 4 ardışık zararı BEŞ stratejinin hepsini birden durdurdu —
+                # henüz tek işlem bile açmamış olanları dahil. İki ayrı sorun:
+                #
+                #  1) DENEY GEÇERSİZLEŞİR. Bir stratejinin kötü serisi
+                #     diğerlerinin veri toplamasını kesiyorsa ölçtüğümüz şey
+                #     stratejiler değil, aralarındaki bulaşma olur.
+                #  2) ÖLÇÜM SANSÜRLENİR. Zarar ederken durdurmak kötü sonuç
+                #     kuyruğunu keser ve stratejiyi olduğundan iyi gösterir.
+                #
+                # Kâğıtta gerçek para riski YOK; korunacak sermaye de yok. O
+                # yüzden burada limit UYGULANMAZ, olay KAYDEDİLİR — bilgi
+                # kaybolmuyor, veri akışı kesilmiyor. Gerçek modda limit aynen
+                # bağlayıcı (bkz. strategy_lab.risk_action: bilinmeyen mod bile
+                # güvenli tarafa, yani durdurmaya düşer).
+                if not can_trade and PAPER_TRADING:
+                    if ks_reason != _ks_last_reason or time.time() - _ks_last_log >= 900:
+                        logger.warning(
+                            f"KİLL SWİTCH (kâğıt — KAYDEDİLDİ, durdurulmadı): {ks_reason}"
+                        )
+                        _ks_last_reason = ks_reason
+                        _ks_last_log = time.time()
+                        try:
+                            from strategy_lab import RiskBreach, record_risk_event
+                            import sqlite3 as _sq
+                            from database import DB_PATH as _DBP
+                            _con = _sq.connect(str(_DBP), timeout=10)
+                            record_risk_event(
+                                _con,
+                                RiskBreach("ALL", "KILL_SWITCH", ks_reason, datetime.now()),
+                                "paper",
+                            )
+                            _con.close()
+                        except Exception:
+                            logger.exception("Risk olayı kaydedilemedi")
+                    can_trade = True
+
                 if not can_trade:
                     # Aynı satırı her turda yazmak logu şişiriyordu: tek bir
                     # kilitte 2,5 günde 7.154 özdeş satır. Sebep değiştiğinde ya da
@@ -1020,6 +1059,10 @@ def run():
                                 f"Momentum bütçesi yetersiz "
                                 f"({kill_switch.momentum_budget_remaining():.2f}R < {alloc_r:.2f}R)"
                             )
+                        if PAPER_TRADING:
+                            # Kâğıtta alt bütçe de bağlamaz; olay kill switch
+                            # kaydında zaten görünüyor.
+                            ok_mom = True
                         if not ok_mom:
                             save_missed_signal(
                                 sig.symbol, sig.action, sig.score, sig.confidence,
@@ -1045,7 +1088,14 @@ def run():
                     # günlük 8R bütçesini aşabiliyordu. Her adaydan hemen önce,
                     # o adayın GERÇEK riskiyle yeniden kontrol ediliyor.
                     ok_budget, budget_reason = kill_switch.can_trade(equity, strategy=strategy)
-                    if not ok_budget or kill_switch.risk_budget_remaining() < alloc_r:
+                    # Kâğıtta risk bütçesi de ORTAK sayaçtan geliyor: bir
+                    # stratejinin harcadığı bütçe diğerlerini kilitliyordu.
+                    # Portföyleri ayırıp bütçeyi ortak bırakmak, ayrımı yarım
+                    # bırakmak olurdu — deney yine bulaşır.
+                    _butce_yetersiz = kill_switch.risk_budget_remaining() < alloc_r
+                    if PAPER_TRADING and (not ok_budget or _butce_yetersiz):
+                        ok_budget, _butce_yetersiz = True, False
+                    if not ok_budget or _butce_yetersiz:
                         save_missed_signal(
                             sig.symbol, sig.action, sig.score, sig.confidence,
                             budget_reason if not ok_budget else
