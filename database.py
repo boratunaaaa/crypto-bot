@@ -108,9 +108,11 @@ CREATE TABLE IF NOT EXISTS bot_state (
 
 -- Açık pozisyonlar. Restart sonrası bot pozisyonlarını unutmaz.
 CREATE TABLE IF NOT EXISTS open_positions (
-    symbol     TEXT PRIMARY KEY,
+    strategy   TEXT NOT NULL DEFAULT 'TREND',
+    symbol     TEXT NOT NULL,
     payload    TEXT,
-    updated_at TEXT
+    updated_at TEXT,
+    PRIMARY KEY (strategy, symbol)
 );
 
 -- Gölge mod: MOMENTUM_FAST'in "açsaydım" kayıtları (gerçek işlem yok).
@@ -188,7 +190,42 @@ _DAILY_COLUMNS = [
 ]
 
 
+def _migrate_open_positions(con) -> None:
+    """`open_positions` anahtarını (strategy, symbol) yap.
+
+    ESKİ ŞEMA TEHLİKELİYDİ: birincil anahtar yalnız `symbol`di ve
+    `save_open_positions` her yazımda tabloyu KOMPLE siliyordu. Tek strateji
+    varken sorun değildi. Çoklu strateji deneyinde ise:
+      * iki strateji aynı sembolü tutarsa biri diğerini sessizce EZERDİ,
+      * bir stratejinin kaydı DİĞERLERİNİN pozisyonlarını SİLERDİ.
+    İkisi de sessiz veri kaybıdır; pozisyon diskten yok olur, bot restart'ta
+    onu yönetmez ve kimse fark etmez.
+
+    Mevcut satırlar kaybolmaz: hepsi 'TREND' stratejisine atanır (bugüne kadar
+    işlem açan tek strateji oydu).
+    """
+    cols = {r[1] for r in con.execute("PRAGMA table_info(open_positions)")}
+    if not cols or "strategy" in cols:
+        return
+    con.executescript("""
+        CREATE TABLE IF NOT EXISTS open_positions_new (
+            strategy   TEXT NOT NULL DEFAULT 'TREND',
+            symbol     TEXT NOT NULL,
+            payload    TEXT,
+            updated_at TEXT,
+            PRIMARY KEY (strategy, symbol)
+        );
+        INSERT OR REPLACE INTO open_positions_new (strategy, symbol, payload, updated_at)
+            SELECT 'TREND', symbol, payload, updated_at FROM open_positions;
+        DROP TABLE open_positions;
+        ALTER TABLE open_positions_new RENAME TO open_positions;
+    """)
+    n = con.execute("SELECT COUNT(*) FROM open_positions").fetchone()[0]
+    logger.info(f"Migration: open_positions (strategy, symbol) anahtarına geçti, {n} kayıt korundu")
+
+
 def _migrate(con):
+    _migrate_open_positions(con)
     # Eski veritabanlarında `mode` sütunu yok.
     try:
         cols = {r[1] for r in con.execute("PRAGMA table_info(trades)")}
@@ -304,17 +341,23 @@ def _json_hook(d):
     return d
 
 
-def save_open_positions(positions: dict) -> None:
-    """Açık pozisyonların tamamını diske yaz (idempotent, tam senkron)."""
+def save_open_positions(positions: dict, strategy: str = "TREND") -> None:
+    """Bir STRATEJİNİN açık pozisyonlarını diske yaz (idempotent).
+
+    `DELETE` artık yalnız bu stratejiyi kapsıyor. Eskiden tabloyu komple
+    siliyordu; çoklu strateji altında bu, bir stratejinin kaydının diğer
+    stratejilerin pozisyonlarını sessizce silmesi demekti.
+    """
     now = datetime.now().isoformat()
     try:
         with _conn() as con:
-            con.execute("DELETE FROM open_positions")
+            con.execute("DELETE FROM open_positions WHERE strategy = ?", (strategy,))
             if positions:
                 con.executemany(
-                    "INSERT INTO open_positions (symbol, payload, updated_at) VALUES (?,?,?)",
+                    "INSERT INTO open_positions (strategy, symbol, payload, updated_at) "
+                    "VALUES (?,?,?,?)",
                     [
-                        (sym, json.dumps(pos, default=_json_default), now)
+                        (strategy, sym, json.dumps(pos, default=_json_default), now)
                         for sym, pos in positions.items()
                     ],
                 )
@@ -322,10 +365,14 @@ def save_open_positions(positions: dict) -> None:
         logger.error(f"Açık pozisyonlar kaydedilemedi: {e}")
 
 
-def load_open_positions() -> dict:
+def load_open_positions(strategy: str = "TREND") -> dict:
+    """Bir stratejinin açık pozisyonları. Strateji verilmezse TREND (mevcut bot)."""
     try:
         with _conn() as con:
-            rows = con.execute("SELECT symbol, payload FROM open_positions").fetchall()
+            rows = con.execute(
+                "SELECT symbol, payload FROM open_positions WHERE strategy = ?",
+                (strategy,),
+            ).fetchall()
             out = {}
             for r in rows:
                 try:

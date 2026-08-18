@@ -393,6 +393,38 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     ("M74", "main.py", "Döngü hatası yeniden fırlatılır (bot ölür)",
      '                time.sleep(min(2.0 * _cycle_errors, float(SIGNAL_INTERVAL)))',
      '                time.sleep(min(2.0 * _cycle_errors, float(SIGNAL_INTERVAL)))\n                raise'),
+
+    # 2026-08-18: strateji başına portföy izolasyonu. Buradaki hatalar SESSİZ
+    # veri kaybıdır: pozisyon diskten yok olur, kimse fark etmez.
+    ("M75", "database.py", "Kayıt yine TÜM stratejilerin pozisyonlarını siler",
+     'con.execute("DELETE FROM open_positions WHERE strategy = ?", (strategy,))',
+     'con.execute("DELETE FROM open_positions")'),
+
+    ("M76", "database.py", "Yükleme strateji süzmez (portföyler karışır)",
+     '''            rows = con.execute(
+                "SELECT symbol, payload FROM open_positions WHERE strategy = ?",
+                (strategy,),
+            ).fetchall()''',
+     '''            rows = con.execute(
+                "SELECT symbol, payload FROM open_positions"
+            ).fetchall()'''),
+
+    ("M77", "portfolios.py", "Bir portföyün kayıt hatası diğerlerini de durdurur",
+     '''            try:
+                kitap.save()
+            except Exception:
+                logger.exception(f"{kitap.name}: portföy kaydedilemedi")''',
+     '            kitap.save()'),
+
+    ("M78", "portfolios.py", "TREND state anahtarı da ön eklenir (bakiye sıfırlanır)",
+     '    return field if strategy == _LEGACY_STRATEGY else f"{strategy}:{field}"',
+     '    return f"{strategy}:{field}"'),
+
+    ("M79", "portfolios.py", "Equity kilitli marjı saymaz (pozisyonlu strateji fakir görünür)",
+     '''        return self.portfolio.balance + sum(
+            float(pos.get("margin", 0.0)) for pos in self.portfolio.positions.values()
+        )''',
+     '        return self.portfolio.balance'),
 ]
 
 
