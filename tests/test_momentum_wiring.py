@@ -158,3 +158,28 @@ def test_bilinmeyen_strateji_TREND_defterine_duser():
         "book_of'un son satırı `return trader` değil — tanımsız strateji "
         "sessizce kaybolabilir"
     )
+
+
+def test_sinyal_KENDI_strateji_adini_tasir():
+    """Yönlendirme sinyalin `strategy` alanına dayanıyor.
+
+    `getattr(sig, "strategy", "TREND")` varsayılanı TREND. MomentumSignal bu
+    alanı taşımasa ya da adı `book_of`unkiyle eşleşmese, MOMENTUM sinyalleri
+    SESSİZCE TREND defterine açılırdı: hata yok, log normal, ama iki strateji
+    aynı kasadan harcar ve deney boşa gider.
+    """
+    from momentum import STRATEGY_NAME, MomentumSignal
+
+    s = MomentumSignal(symbol="XUSDT", action="BUY", score=85,
+                       confidence=0.85, price=1.0)
+    assert s.strategy == STRATEGY_NAME == "MOMENTUM_FAST"
+    # book_of'un beklediği ad ile birebir aynı olmalı.
+    assert f'strategy == "{STRATEGY_NAME}"' in _MAIN, (
+        "book_of, momentum sinyalinin taşıdığı strateji adını tanımıyor"
+    )
+
+
+def test_golge_kaydi_artik_yapilmiyor():
+    """Gölge modda kalsaydı işlem hiç açılmaz, deney başlamazdı."""
+    assert "if MOMENTUM_SHADOW_MODE:" in _MAIN   # kod yolu duruyor (geri dönüş mümkün)
+    assert config.MOMENTUM_SHADOW_MODE is False  # ama kapalı

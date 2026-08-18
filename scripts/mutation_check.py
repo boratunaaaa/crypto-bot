@@ -449,6 +449,10 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     ("M84", "config.py", "MOMENTUM sermayesi TREND'den farklı (kıyas bozulur)",
      'MOMENTUM_BALANCE       = 1000.0',
      'MOMENTUM_BALANCE       = 250.0'),
+
+    ("M85", "momentum.py", "Sinyal strateji adini tasimaz (sessizce TREND kasasindan harcar)",
+     'STRATEGY_NAME = "MOMENTUM_FAST"',
+     'STRATEGY_NAME = "TREND"'),
 ]
 
 
