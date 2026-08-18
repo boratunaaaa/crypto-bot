@@ -483,6 +483,10 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
      '''        if strategy in lab_books:
             return lab_books[strategy].portfolio''',
      '        pass'),
+
+    ("M92", "config.py", "Bar sayisi stratejilerin ihtiyacindan az (sessiz olum)",
+     'CANDLE_LIMIT = 250',
+     'CANDLE_LIMIT = 120'),
 ]
 
 

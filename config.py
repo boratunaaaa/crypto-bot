@@ -28,7 +28,17 @@ TF_ENTRY   = "5m"   # giriş sinyali (1m'den daha az gürültülü)
 TF_TREND   = "15m"  # kısa vadeli trend
 TF_MACRO   = "1h"   # orta vadeli yön
 TF_CONTEXT = "4h"   # büyük resim — en ağırlıklı filtre
-CANDLE_LIMIT = 120
+# 2026-08-18: 120 -> 250. Deney stratejileri EMA200 kullanıyor ve 120 barla
+# ASLA sinyal üretemiyorlardı: üçü de her turda "yetersiz veri" deyip susuyordu.
+# Sessiz ölümün ders kitabı örneği — bot çalışıyor, log akıyor, işlem yok.
+#
+# Maliyeti YOK: Binance futures klines ağırlığı 101-500 bar aralığında sabit
+# (2), yani 120 ile 250 aynı ağırlıkta. Ayrıca uzun geçmiş EMA/RSI/ATR'nin
+# başlangıç sapmasını azaltır, yani mevcut göstergeler de daha doğru olur.
+#
+# Şimdi yapılmasının sebebi: deney başlangıcı BUGÜN. Veri biriktikten sonra
+# değiştirmek, ölçüm penceresini ortasından bölmek olurdu.
+CANDLE_LIMIT = 250
 
 # ─── Coin evreni ──────────────────────────────────────────────────────────────
 # 2026-08-12: TOP_N 100→250. missed_signals analizi, kaçan yüksek skorlu

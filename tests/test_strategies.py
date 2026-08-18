@@ -212,3 +212,22 @@ def test_scan_fiyat_alinamayan_sembolu_atlar():
     df = _df(_yatay(260))
     out = st.scan(["XUSDT"], lambda s: df, lambda s: None)
     assert out == []
+
+
+def test_stratejiler_MEVCUT_veriyle_calisabiliyor():
+    """SESSİZ ÖLÜM KORUMASI.
+
+    2026-08-18: stratejiler EMA200 için 210 bar istiyordu, sistem 120 bar
+    çekiyordu. Üçü de her turda "yetersiz veri" deyip sustu — bot çalışıyor,
+    log akıyor, işlem yok. Canlıda 142 değerlendirmenin 142'si reddedildi.
+
+    Bu test o sınıfı kapatır: bir strateji sistemin çektiğinden fazla bar
+    isterse ASLA işlem açamaz ve bunu hiçbir gösterge göstermez.
+    """
+    from config import CANDLE_LIMIT
+
+    assert st.MIN_BARS <= CANDLE_LIMIT, (
+        f"stratejiler {st.MIN_BARS} bar istiyor ama sistem {CANDLE_LIMIT} "
+        f"çekiyor — hiçbiri asla sinyal üretemez"
+    )
+    assert st.EMA_SLOW < CANDLE_LIMIT
