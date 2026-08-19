@@ -666,6 +666,16 @@ def run():
         if not semboller:
             return
 
+        # Açık pozisyonlara adanmış fiyat akışını güncel tut. Toplu akış bazı
+        # sembolleri sessizce düşürüyor; stop kararının dayandığı fiyat en taze
+        # olması gereken fiyattır.
+        try:
+            mdm.set_priority_symbols(semboller)
+        except Exception:
+            # Adanmış akış bir iyileştirme; kurulamazsa REST yedeği devrede
+            # kalır ve pozisyon yönetimi DURMAZ.
+            logger.debug("Adanmış akış güncellenemedi", exc_info=True)
+
         px = mdm.get_prices_for(sorted(semboller), max_age_seconds=MAX_PRICE_AGE_SEC)
         # Taze fiyat yoksa karar YOK. Bayat fiyatla stop kararı vermek,
         # kararı hiç vermemekten kötüdür.

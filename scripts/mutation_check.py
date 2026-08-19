@@ -495,6 +495,23 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     ("M94", "main.py", "Risk butcesi kagit modda da baglar (deney bulasir)",
      'if PAPER_TRADING and (not ok_budget or _butce_yetersiz):',
      'if False:'),
+
+    # 2026-08-19: acik pozisyonlara adanmis fiyat akisi. Stop asimi -1.28R'de
+    # takili kalmisti; kalan bosluk 20 saniyelik tazelik penceresiydi.
+    ("M95", "market_data.py", "Kapanan pozisyonun akisi kapatilmaz (soket sizintisi)",
+     '''            for sym in mevcut - istenen:
+                anahtar = self._prio_streams.pop(sym, None)''',
+     '''            for sym in []:
+                anahtar = self._prio_streams.pop(sym, None)'''),
+
+    ("M96", "market_data.py", "WS yeniden baslayinca abonelikler temizlenmez (adanmis akis olur)",
+     '''        with self._prio_lock:
+            self._prio_streams.clear()''',
+     '        pass'),
+
+    ("M97", "main.py", "Adanmis akis hic guncellenmez (toplu akisa geri duser)",
+     '            mdm.set_priority_symbols(semboller)',
+     '            pass'),
 ]
 
 

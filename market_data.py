@@ -96,6 +96,9 @@ class MarketDataManager:
         self._spread:     dict[str, float] = {}
 
         self._twm:        ThreadedWebsocketManager | None = None
+        # Açık pozisyonlara adanmış akışlar: sembol -> soket anahtarı.
+        self._prio_streams: dict[str, str] = {}
+        self._prio_lock = threading.Lock()
         self._running     = False
         self._last_ws_msg = time.time()
         # Mesaj akıyor ama hiçbiri fiyata dönüşmüyorsa bu bir FORMAT hatasıdır,
@@ -307,6 +310,9 @@ class MarketDataManager:
             return False
 
     def _stop_twm(self):
+        # Soket anahtarları eski yöneticiye aitti; yenisinde geçersizdir.
+        with self._prio_lock:
+            self._prio_streams.clear()
         """Mevcut TWM'i güvenle kapat."""
         twm = self._twm
         self._twm = None
@@ -411,6 +417,14 @@ class MarketDataManager:
                 twm.start_all_ticker_futures_socket(callback=on_ticker)
                 stream = "futures ticker"
             self._twm = twm
+            # WS yeniden başladığında adanmış akışlar da yeniden kurulmalı;
+            # yoksa restart sonrası açık pozisyonlar sessizce toplu akışa
+            # (yani sorunun kaynağına) geri düşer.
+            with self._prio_lock:
+                onceki = list(self._prio_streams)
+                self._prio_streams.clear()
+            if onceki:
+                self.set_priority_symbols(onceki)
             self._last_ws_msg = time.time()
             self._last_price_update = time.time()
             self._fmt_alerted = False
@@ -419,6 +433,72 @@ class MarketDataManager:
         except Exception as e:
             logger.error(f"WebSocket başlatma hatası: {e}")
             self._twm = None
+
+    # ── Öncelikli semboller: açık pozisyonlara ADANMIŞ akış ──────────────────
+
+    def set_priority_symbols(self, symbols) -> None:
+        """Açık pozisyonların sembollerine adanmış WS akışı aç/kapat.
+
+        NEDEN: toplu akış (`!bookTicker`) bazı sembolleri sessizce düşürüyor.
+        Ölçüldü: bir sembolün fiyatı 120 saniye boyunca güncellenmedi ve stop
+        kontrolü o bayat fiyatla çalıştı. REST yedeği eklenince en kötü hâl
+        120s'den 20s'ye indi ama SORUN BİTMEDİ: `INITIAL_STOP` ortalaması
+        sıfırlamadan bu yana hâlâ **-1.28R** (hedef -1.0R). Yani her stop
+        planlanandan ~%28 pahalıya kapanıyor.
+
+        Sembole adanmış akış bu boşluğu kapatır: tek sembollük abonelik toplu
+        akışın seçiciliğine tabi değildir ve saniyenin altında güncellenir.
+        Yalnız AÇIK POZİSYONLAR için açılır — evrenin tamamına adanmış akış
+        açmak ne gerekli ne mümkün.
+
+        REST yedeği KALDIRILMADI: adanmış akış da düşebilir, ve düşerse yine
+        20 saniyede REST devreye girer. Katmanlar birbirinin yedeği.
+        """
+        istenen = {s.upper() for s in (symbols or [])}
+        with self._prio_lock:
+            mevcut = set(self._prio_streams)
+            if istenen == mevcut:
+                return
+            twm = self._twm
+            # Fazlalıkları kapat
+            for sym in mevcut - istenen:
+                anahtar = self._prio_streams.pop(sym, None)
+                if twm and anahtar:
+                    try:
+                        twm.stop_socket(anahtar)
+                    except Exception:
+                        # Kapatılamayan soket sızıntıdır ama pozisyonu
+                        # yönetimsiz bırakmaktan iyidir; sessizce geçme, logla.
+                        logger.debug(f"{sym}: adanmış akış kapatılamadı")
+            # Eksikleri aç
+            if twm is None:
+                return
+            for sym in istenen - set(self._prio_streams):
+                try:
+                    anahtar = twm.start_symbol_ticker_futures_socket(
+                        callback=self._on_priority_msg, symbol=sym
+                    )
+                    self._prio_streams[sym] = anahtar
+                    logger.info(f"{sym}: adanmış fiyat akışı açıldı")
+                except Exception as exc:
+                    # Açılamazsa sessizce vazgeçme: bu sembol yine toplu akış
+                    # ve REST yedeğiyle yürür, ama bunu bilmek gerekir.
+                    logger.warning(f"{sym}: adanmış akış açılamadı ({exc})")
+
+    def _on_priority_msg(self, msg) -> None:
+        """Adanmış akıştan gelen fiyat. Toplu akışla AYNI ayrıştırıcı."""
+        now = time.time()
+        self._last_ws_msg = now
+        payload = msg
+        if isinstance(payload, dict) and "data" in payload:
+            payload = payload["data"]
+        items = payload if isinstance(payload, list) else [payload]
+        updated = 0
+        with self._lock:
+            for item in items:
+                updated += self._ingest_ticker(item, now)
+        if updated:
+            self._last_price_update = now
 
     def _ws_watchdog(self):
         """Ağ kesintilerinde WebSocket'i otomatik yeniden başlat."""

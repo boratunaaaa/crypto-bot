@@ -233,3 +233,21 @@ def test_deney_stratejileri_kendi_esigini_kullanir():
 def test_kayitli_strateji_sayisi_ve_adlari():
     import strategies as st
     assert set(st.REGISTRY) == {"BREAKOUT", "PULLBACK", "MEANREV"}
+
+
+def test_adanmis_akis_ana_donguden_GUNCELLENIYOR():
+    """Çağrılmazsa açık pozisyonlar sessizce toplu akışa (sorunun kaynağına)
+    geri düşer ve stop kararı yine 20 saniyeye kadar bayat fiyatla verilir."""
+    assert "mdm.set_priority_symbols(semboller)" in _MAIN, (
+        "adanmış fiyat akışı ana döngüden hiç güncellenmiyor"
+    )
+    # Pozisyon sembolleri hesaplandıktan SONRA çağrılmalı, öncesinde değil.
+    assert _MAIN.index("semboller = {") < _MAIN.index("mdm.set_priority_symbols(")
+
+
+def test_adanmis_akis_hatasi_pozisyon_yonetimini_DURDURMAZ():
+    """Akış bir iyileştirme; kurulamazsa REST yedeği devrede kalmalı."""
+    yer = _MAIN.index("mdm.set_priority_symbols(semboller)")
+    bolum = _MAIN[yer:yer + 500]
+    assert "except Exception" in bolum
+    assert "get_prices_for" in bolum, "hata sonrası REST yolu izlenmiyor"
