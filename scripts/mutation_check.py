@@ -512,6 +512,14 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     ("M97", "main.py", "Adanmis akis hic guncellenmez (toplu akisa geri duser)",
      '            mdm.set_priority_symbols(semboller)',
      '            pass'),
+
+    ("M98", "strategy_lab.py", "Ters yonlu islemler de ortusme sayilir (sahte korelasyon)",
+     'if sym == sym2 and yon == yon2 and abs(zaman - zaman2) <= pencere:',
+     'if sym == sym2 and abs(zaman - zaman2) <= pencere:'),
+
+    ("M99", "strategy_lab.py", "Ortusme orani buyuk tarafa bolunur (korelasyon gizlenir)",
+     'return ortusen / min(len(A), len(B))',
+     'return ortusen / max(len(A), len(B))'),
 ]
 
 

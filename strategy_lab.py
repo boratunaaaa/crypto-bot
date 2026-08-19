@@ -536,3 +536,75 @@ def stalled_strategies(
         if son is None or (ref - son) > sinir:
             durmus.append(ad)
     return sorted(durmus)
+
+
+# ── Korelasyon: üç "nitelikli" strateji tek risk olabilir ─────────────────────
+#
+# `qualified` listesi birden fazla strateji döndürebilir. Ama üçü de aynı
+# piyasa hareketlerinden kazanıyorsa elimizde üç strateji DEĞİL, üç kılığa
+# girmiş TEK risk vardır. O durumda ikisine birden sermaye ayırmak
+# çeşitlendirme değil, aynı bahsi iki kere oynamaktır — ve düşüş geldiğinde
+# hepsi birlikte kaybeder.
+#
+# Ölçüm basit tutuldu: aynı sembolde, birbirine yakın zamanda, AYNI YÖNDE
+# açılan işlemler "örtüşen bahis" sayılır. Getiri korelasyonu hesaplamak daha
+# zarif olurdu ama işlemler eşzamanlı değil; örtüşme oranı bu veriyle
+# ölçülebilen ve yanlış yorumlanması zor olan bir gösterge.
+
+
+def overlap_ratio(
+    a_trades: Sequence[dict], b_trades: Sequence[dict], window_minutes: int = 60
+) -> float:
+    """İki stratejinin AYNI bahsi oynama oranı (0-1).
+
+    Aynı sembol + aynı yön + `window_minutes` içinde açılış = örtüşme.
+    Bölen küçük olan taraf: 5 işlemlik bir strateji 100 işlemlik biriyle
+    kıyaslanırken oran, küçük olanın ne kadarının kopya olduğunu göstermeli.
+    """
+    def _anahtarlar(trades):
+        out = []
+        for t in trades:
+            ot = t.get("open_time")
+            if isinstance(ot, str):
+                try:
+                    ot = datetime.fromisoformat(ot)
+                except ValueError:
+                    continue
+            if not ot or not t.get("symbol"):
+                continue
+            out.append((t["symbol"], (t.get("side") or "").upper(), ot))
+        return out
+
+    A, B = _anahtarlar(a_trades), _anahtarlar(b_trades)
+    if not A or not B:
+        return 0.0
+
+    pencere = timedelta(minutes=window_minutes)
+    ortusen = 0
+    for sym, yon, zaman in A:
+        for sym2, yon2, zaman2 in B:
+            if sym == sym2 and yon == yon2 and abs(zaman - zaman2) <= pencere:
+                ortusen += 1
+                break
+    return ortusen / min(len(A), len(B))
+
+
+def correlation_warnings(
+    trades_by_strategy: dict, threshold: float = 0.30
+) -> list[str]:
+    """Aynı riski taşıyan strateji çiftleri.
+
+    Eşik bir karar değil, bir UYARI sınırı: üstünde çıkan çiftler için
+    "ikisine birden sermaye ver" kararı insan incelemesi ister.
+    """
+    adlar = sorted(trades_by_strategy)
+    uyarilar = []
+    for i, a in enumerate(adlar):
+        for b in adlar[i + 1:]:
+            oran = overlap_ratio(trades_by_strategy[a], trades_by_strategy[b])
+            if oran >= threshold:
+                uyarilar.append(
+                    f"{a} ve {b} işlemlerinin %{oran*100:.0f}'i örtüşüyor — "
+                    f"iki strateji değil, aynı riskin iki kılığı olabilir"
+                )
+    return uyarilar

@@ -30,6 +30,8 @@ from strategy_lab import (
     record_trial,
     risk_action,
     stalled_strategies,
+    overlap_ratio,
+    correlation_warnings,
     RiskBreach,
     RISK_ACTION_HALT,
     RISK_ACTION_RECORD_ONLY,
@@ -308,3 +310,66 @@ def test_kumelenmis_islemler_standart_hatayi_KUCULTMEZ():
     assert not sonuc.promoted, (
         "10 bağımsız gözlemle terfi etti — kümelenmiş veri bağımsız sanıldı"
     )
+
+
+# ── Korelasyon ────────────────────────────────────────────────────────────────
+# `qualified` birden fazla strateji döndürebilir. Ama üçü de aynı hareketlerden
+# kazanıyorsa elimizde üç strateji DEĞİL, üç kılığa girmiş tek risk vardır;
+# ikisine birden sermaye ayırmak çeşitlendirme değil, aynı bahsi iki kez
+# oynamaktır.
+
+def _islem_sym(sym, yon, dk):
+    return {"symbol": sym, "side": yon,
+            "open_time": (BAS + timedelta(minutes=dk)).isoformat()}
+
+
+def test_ayni_bahsi_oynayan_stratejiler_yakalanir():
+    a = [_islem_sym("AAAUSDT", "BUY", 0), _islem_sym("BBBUSDT", "BUY", 100)]
+    b = [_islem_sym("AAAUSDT", "BUY", 10), _islem_sym("BBBUSDT", "BUY", 105)]
+    assert overlap_ratio(a, b) == pytest.approx(1.0)
+
+
+def test_farkli_bahisler_ortusmez():
+    a = [_islem_sym("AAAUSDT", "BUY", 0)]
+    b = [_islem_sym("CCCUSDT", "BUY", 0)]
+    assert overlap_ratio(a, b) == 0.0
+
+
+def test_ters_yon_ortusme_SAYILMAZ():
+    """Aynı sembolde biri alıyor biri satıyorsa bu aynı risk değildir."""
+    a = [_islem_sym("AAAUSDT", "BUY", 0)]
+    b = [_islem_sym("AAAUSDT", "SELL", 5)]
+    assert overlap_ratio(a, b) == 0.0
+
+
+def test_zaman_uzaksa_ortusme_SAYILMAZ():
+    """Aynı sembolde günler arayla işlem, aynı hareket değildir."""
+    a = [_islem_sym("AAAUSDT", "BUY", 0)]
+    b = [_islem_sym("AAAUSDT", "BUY", 5000)]
+    assert overlap_ratio(a, b) == 0.0
+
+
+def test_oran_kucuk_tarafa_gore_hesaplanir():
+    """5 işlemlik strateji 100 işlemlikle kıyaslanırken oran, KÜÇÜK olanın
+    ne kadarının kopya olduğunu göstermeli."""
+    a = [_islem_sym("AAAUSDT", "BUY", 0)]
+    b = [_islem_sym("AAAUSDT", "BUY", 5)] + [
+        _islem_sym(f"X{i}USDT", "BUY", 1000 + i) for i in range(20)
+    ]
+    assert overlap_ratio(a, b) == pytest.approx(1.0)
+
+
+def test_bos_liste_sifir():
+    assert overlap_ratio([], [_islem_sym("A", "BUY", 0)]) == 0.0
+
+
+def test_uyari_uretiliyor():
+    ortak = [_islem_sym("AAAUSDT", "BUY", 0), _islem_sym("BBBUSDT", "BUY", 50)]
+    farkli = [_islem_sym("ZZZUSDT", "SELL", 900)]
+    uyarilar = correlation_warnings({
+        "A": ortak,
+        "B": [_islem_sym("AAAUSDT", "BUY", 5), _islem_sym("BBBUSDT", "BUY", 55)],
+        "C": farkli,
+    })
+    assert any("A ve B" in u for u in uyarilar)
+    assert not any("C" in u for u in uyarilar)
